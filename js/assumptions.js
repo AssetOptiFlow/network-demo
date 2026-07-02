@@ -1,0 +1,20 @@
+// assumptions.js — every modelling assumption, surfaced in the UI.
+// Each entry mirrors a labelled ASSUMPTION comment in the source module.
+
+export const ASSUMPTIONS = [
+  { area: "Geography", text: "30 × 30 km invented map on a 200 m grid; sea along one seed-chosen edge; one river traced high-ground → sea by noisy steepest descent (60–140 m wide). No real data. (terrain.js)" },
+  { area: "Geography", text: "Buildable land = main landmass, not water, slope < 0.35 m/m. Customers and roads exist only there. (terrain.js)" },
+  { area: "Towns", text: "Towns seeded at flat, coastal-biased sites ≥ 4 km apart; density = per-town Gaussians × fBm noise (same noise family as terrain). (density.js)" },
+  { area: "Roads", text: "Arterials = MST between towns + one loop link, A*-routed with slope-squared cost multiplier (capped 9×); sea impassable; first river crossing builds a bridge (28× penalty), later roads reuse it (1.3×). (roads.js)" },
+  { area: "Roads", text: "Urban streets: rotated lattice, 130–165 m spacing, kept where town Gaussian is high; every 4th line is a collector. Rural: A* spurs to customer clusters > 350 m from a road. (roads.js)" },
+  { area: "Electrical", text: "Distribution transformers: greedy capacitated clustering, ≤ 50 customers, gathered within 500 m urban / 1500 m rural; TX at road node nearest centroid. LV below the TX not modelled. (network.js)" },
+  { area: "Electrical", text: "Zone subs: greedy facility location over ROAD distance (weighted 1-median) — first sub minimises total customer·distance, each further sub is accepted only if it captures ≥500 customers and either saves them ≥2 km each on average (rural sub) or relieves a sub serving >4000 (urban split). Max 10 subs. TXs assigned by multi-source Dijkstra — strictly radial, all conductors follow roads. (network.js)" },
+  { area: "Electrical", text: "Feeder sizing: each sub tree is partitioned to a density-scaled target — ~250 customers rural up to ~700 urban (≈400 average). Feeder heads connect to the sub by an express run of parallel circuit along the same roads, charged to that feeder as un-switchable base SAIDI; a head >4 km from its sub merges into the feeder owning its trunk instead (long single rural feeders beat implausible parallel circuits). (network.js, reliability.js)" },
+  { area: "Electrical", text: "Line sections in cells above the density threshold are UNDERGROUND cable (drawn dashed), the rest overhead. λ defaults: 0.10 OH / 0.03 UG faults/km/yr, both adjustable in the UI; repair is a flat 120 min for both — a simplification that flatters cable repairs. (network.js, reliability.js)" },
+  { area: "Reliability", text: "Fault rates are uniform WITHIN each line type (overhead vs underground) — no weather, vegetation or asset-age variation. Debug mode can double λ on one branch. (reliability.js)" },
+  { area: "Reliability", text: "Unrestored-customer outage = crew travel from the zone sub (crew depot) along roads at 50 km/h to segment midpoint + flat 120 min repair. (reliability.js)" },
+  { area: "Reliability", text: "Sectionalising: open deepest upstream switch, reclose the tripped device; everyone else in the tripped zone restored after a flat 45 min. Flat time makes greedy placement provably monotone. Radial — no backfeed. (reliability.js)" },
+  { area: "Reliability", text: "Reclosers are ideal protection: a fault downstream is cleared by the recloser, customers upstream see NO sustained interruption. Momentary interruptions (SAIFI/MAIFI), fuse saving and protection coordination limits are NOT modelled. (reliability.js)" },
+  { area: "Reliability", text: "Baseline is device-free: one breaker per feeder, no fuses. One device per line section." },
+  { area: "General", text: "Plausible, not optimal — greedy/heuristic everywhere, matching the untidy way real networks accrete. Seeded and deterministic throughout." },
+];

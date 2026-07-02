@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NZ-style Distribution Network Sandbox</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="banner">
+  ⚠ TOY — not a trusted tool. Every number here comes from invented geography and
+  labelled simplifying assumptions (see the Assumptions panel). Not for any real decision.
+</div>
+<pre id="selftest-out" style="display:none"></pre>
+<div id="app">
+  <div id="mapwrap">
+    <canvas id="map"></canvas>
+    <div id="maplegend">
+      <span><i class="chip" style="background:#52514e"></i> road</span>
+      <span><i class="chip chip-line"></i> feeder (colour = identity, dashed = underground)</span>
+      <span><i class="chip" style="background:#fcfcfb;border:2px solid #2a78d6"></i> sectionaliser</span>
+      <span><i class="chip" style="background:#2a78d6;border:1.5px solid #0b0b0b;transform:rotate(45deg)"></i> recloser</span>
+      <span><i class="chip" style="background:#fff;border:1.5px solid #0b0b0b"></i> bridge</span>
+      <span><i class="chip" style="background:#0b0b0b"></i> zone sub</span>
+    </div>
+  </div>
+
+  <div id="side">
+    <section>
+      <h2>Generate</h2>
+      <div class="row">
+        <label for="seed">Seed</label>
+        <input id="seed" type="text" value="aotearoa" spellcheck="false">
+        <button id="randomSeed" title="Random seed">🎲</button>
+      </div>
+      <div class="row">
+        <label for="nCust">Customers <span id="nCustVal">6000</span></label>
+        <input id="nCust" type="range" min="3000" max="20000" step="100" value="6000">
+      </div>
+      <div class="row">
+        <label for="nTowns">Towns <span id="nTownsVal">5</span></label>
+        <input id="nTowns" type="range" min="3" max="6" step="1" value="5">
+      </div>
+      <button id="regen" class="primary">Regenerate</button>
+      <div id="genTime" class="detail"></div>
+    </section>
+
+    <section>
+      <h2>Layers</h2>
+      <div id="layerboxes">
+        <label><input type="checkbox" id="layer-terrain"> terrain</label>
+        <label><input type="checkbox" id="layer-density"> density</label>
+        <label><input type="checkbox" id="layer-roads"> roads</label>
+        <label><input type="checkbox" id="layer-customers"> customers</label>
+        <label><input type="checkbox" id="layer-network"> feeders</label>
+        <label><input type="checkbox" id="layer-txs"> transformers</label>
+        <label><input type="checkbox" id="layer-switches"> switches</label>
+        <label><input type="checkbox" id="layer-bridges"> bridges</label>
+        <label><input type="checkbox" id="layer-roadVsLine"> road vs line</label>
+      </div>
+      <div class="detail">Drag to pan, wheel to zoom. Click a feeder line for stats.
+        With “road vs line” on and a section selected: solid black = crew road route,
+        dashed red = straight line from the sub.</div>
+    </section>
+
+    <section>
+      <h2>SAIDI <span class="unit">(min / customer / yr)</span></h2>
+      <div id="tiles">
+        <div class="tile"><div class="tilelabel">Baseline (no devices)</div><div class="tileval" id="saidiBase">–</div></div>
+        <div class="tile"><div class="tilelabel">With <span id="saidiSwitches">0</span> SW + <span id="saidiReclosers">0</span> RC</div><div class="tileval" id="saidiNow">–</div></div>
+        <div class="tile"><div class="tilelabel">Improvement</div><div class="tileval" id="saidiDelta">–</div></div>
+      </div>
+      <div class="row">
+        <label for="rateOh">λ overhead</label>
+        <input id="rateOh" type="number" step="0.01" min="0" max="2" value="0.10" style="width:5em">
+        <label for="rateUg">λ underground</label>
+        <input id="rateUg" type="number" step="0.01" min="0" max="2" value="0.03" style="width:5em">
+      </div>
+      <div class="detail">faults / km / yr per line type. Underground = sections in
+        high-density cells (drawn dashed). Repair stays a flat 120 min for both —
+        a simplification that flatters cable repairs.</div>
+    </section>
+
+    <section>
+      <h2>Greedy devices</h2>
+      <div class="row">
+        <label for="nSwitches">Sectionalisers</label>
+        <input id="nSwitches" type="number" min="1" max="60" value="8" style="width:4em">
+        <button id="placeSwitches" class="primary">Place</button>
+      </div>
+      <div class="row">
+        <label for="nReclosers">Reclosers</label>
+        <input id="nReclosers" type="number" min="1" max="30" value="4" style="width:4em">
+        <button id="placeReclosers" class="primary">Place</button>
+        <button id="resetSwitches">Reset all</button>
+      </div>
+      <div class="detail">Sectionalisers restore upstream customers at 45 min.
+        Reclosers clear downstream faults — upstream customers see no sustained
+        interruption at all (momentaries not modelled).</div>
+      <label class="detail"><input type="checkbox" id="debugRate">
+        Debug: double λ on one branch (first pick should move — proof the score is rate-weighted)</label>
+      <div id="debugInfo" class="detail"></div>
+      <div id="greedyLog"></div>
+    </section>
+
+    <section>
+      <h2>Fault playback</h2>
+      <label><input type="checkbox" id="faultMode"> <strong>Fault mode</strong> — click a line section to fault it</label>
+      <button id="clearFault">Clear</button>
+      <div id="playbackInfo" class="detail"></div>
+      <div class="detail legendline">
+        <span><i class="chip" style="background:#d03b3b"></i> faulted</span>
+        <span><i class="chip" style="background:#ec835a"></i> out until repair</span>
+        <span><i class="chip" style="background:#fab219"></i> isolatable (waiting)</span>
+        <span><i class="chip" style="background:#0ca30c"></i> restored</span>
+        <span><i class="chip" style="background:#fcfcfb;border:1.5px solid #898781"></i> unaffected (upstream of recloser — keeps feeder colour)</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>Road vs straight line <span class="unit">(sub → fault, rate-weighted)</span></h2>
+      <table id="rvlTable"></table>
+      <div class="detail">Ratio &gt; 1 because crews follow roads — bridges and terrain detours push it up, differently per feeder.</div>
+    </section>
+
+    <section>
+      <h2>Feeder stats</h2>
+      <div id="feederStats"></div>
+    </section>
+
+    <section>
+      <h2>Correctness checks <span class="unit">(asserted, not assumed)</span></h2>
+      <div id="checks"></div>
+    </section>
+
+    <section>
+      <h2>Assumptions</h2>
+      <div id="assumptions"></div>
+    </section>
+  </div>
+</div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
