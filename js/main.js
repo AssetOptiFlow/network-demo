@@ -28,7 +28,7 @@ export function generate(params) {
   mark("terrain", t);
 
   t = performance.now();
-  const towns = seedTowns(terrain, rng.fork("towns"), params.nTowns);
+  const towns = seedTowns(terrain, rng.fork("towns"), params.nTowns, params.inlandWeight ?? 0.25);
   const density = buildDensityGrid(terrain, towns, rng.fork("density"));
   mark("density", t);
 
@@ -51,10 +51,51 @@ export function generate(params) {
   t = performance.now();
   world.checks = runChecks(world);
   world.roadVsLine = roadVsLine(net, graph);
+
+  // Subtransmission overlay: GXP site + lines to zone subs. VISUAL ONLY —
+  // asserted, not assumed: SAIDI and network structure must be identical
+  // before and after the overlay is computed.
+  const saidiBefore = computeSaidi(net, emptyDevices()).overall;
+  const edgesBefore = net.treeEdges.length, feedersBefore = net.feeders.length;
+  world.gxp = pickGxp(terrain, net);
+  const saidiAfter = computeSaidi(net, emptyDevices()).overall;
+  const overlayOk = saidiBefore === saidiAfter &&
+    net.treeEdges.length === edgesBefore && net.feeders.length === feedersBefore;
+  console.assert(overlayOk, "subtransmission overlay changed the numbers");
+  world.checks.push({
+    name: "Subtransmission overlay is visual-only",
+    pass: overlayOk,
+    detail: `SAIDI ${saidiBefore.toFixed(2)} → ${saidiAfter.toFixed(2)} min/yr, ` +
+      `${edgesBefore} → ${net.treeEdges.length} sections, ${feedersBefore} → ${net.feeders.length} feeders`,
+  });
   mark("checks", t);
   timings.total = Math.round(performance.now() - t0);
   world.timings = timings;
   return world;
+}
+
+// A plausible GXP (grid exit point): a flat mainland cell on the map edge
+// nearest the load-weighted centroid of the zone subs — where the national
+// grid would most cheaply enter this patch of country. Purely decorative.
+function pickGxp(terrain, net) {
+  const loads = net.subs.map(s =>
+    net.feeders.filter(f => f.sub === s.id).reduce((t, f) => t + f.customers, 0));
+  let wx = 0, wy = 0, W = 0;
+  net.subs.forEach((s, i) => { wx += s.x * loads[i]; wy += s.y * loads[i]; W += loads[i]; });
+  if (W <= 0) return null;
+  wx /= W; wy /= W;
+  const n = terrain.n;
+  let best = null, bestScore = Infinity;
+  for (let k = 0; k < n; k++) {
+    for (const [cx, cy] of [[k, 0], [k, n - 1], [0, k], [n - 1, k]]) {
+      const i = terrain.idx(cx, cy);
+      if (terrain.water[i] !== 0 || !terrain.mainland[i]) continue;
+      const [x, y] = terrain.cellCentre(cx, cy);
+      const score = Math.hypot(x - wx, y - wy) + terrain.slope[i] * 40000;
+      if (score < bestScore) { bestScore = score; best = { x, y }; }
+    }
+  }
+  return best;
 }
 
 // ------------------------------------------------------------- selftest
@@ -153,22 +194,57 @@ function selftest() {
       recloserPlacements: greedyRc.log.filter(l => !l.stopped).length,
       debugSupported: dbg.supported,
       debugMoved: dbg.supported ? dbg.moved : null,
+      debugRateWeighted: dbg.supported ? dbg.rateWeighted : null,
       faultConservation: conservation.every(Boolean),
       roadVsLineMin: +Math.min(...rvl.map(r => r.ratio)).toFixed(3),
       roadVsLineMax: +Math.max(...rvl.map(r => r.ratio)).toFixed(3),
+      gxp: world.gxp ? [Math.round(world.gxp.x), Math.round(world.gxp.y)] : null,
+      curveKnees: (() => {
+        const mk = (kind) => {
+          const res = greedyPlace(net, 20, kind);
+          const pts = [res.baseline];
+          for (const l of res.log) if (!l.stopped) pts.push(l.saidiAfter);
+          return kneeIndex(pts);
+        };
+        return { sw: mk("switch"), rc: mk("recloser") };
+      })(),
     });
   }
+  // Inland-weighting slider path: full-inland towns must still generate a
+  // clean network, and must actually move the towns.
+  const wCoast = generate({ seed: "aotearoa-1", nCust: 4000, nTowns: 5, inlandWeight: 0 });
+  const wInland = generate({ seed: "aotearoa-1", nCust: 4000, nTowns: 5, inlandWeight: 1 });
+  const inlandTest = {
+    checksPass: wInland.checks.every(c => c.pass),
+    townsMoved: JSON.stringify(wCoast.towns.map(t => [t.x | 0, t.y | 0])) !==
+      JSON.stringify(wInland.towns.map(t => [t.x | 0, t.y | 0])),
+    meanCoastDistCoastal: townCoastDist(wCoast),
+    meanCoastDistInland: townCoastDist(wInland),
+  };
   const allPass = results.every(r =>
     r.checks.every(c => c.pass) && r.greedyMonotone && r.recloserMonotone &&
     r.faultConservation &&
     r.meanCustPerFeeder >= 200 && r.meanCustPerFeeder <= 800 &&
-    r.totalMs < 5000 && (!r.debugSupported || r.debugMoved !== false));
-  const out = { allPass, results };
+    r.gxp !== null && r.curveKnees.sw >= 1 && r.curveKnees.rc >= 1 &&
+    r.totalMs < 5000 && (!r.debugSupported || r.debugRateWeighted === true)) &&
+    inlandTest.checksPass && inlandTest.townsMoved;
+  const out = { allPass, inlandTest, results };
   const pre = document.getElementById("selftest-out");
   pre.textContent = JSON.stringify(out, null, 1);
   pre.style.display = "block";
   document.title = "SELFTEST-DONE";
   return out;
+}
+
+// Mean straight-line distance (km) from towns to the coast edge — used by
+// the selftest to show the inland slider actually pulls towns inland.
+function townCoastDist(world) {
+  const t = world.terrain;
+  const d = world.towns.map(tn => {
+    const [cx, cy] = t.cellOf(tn.x, tn.y);
+    return t._coastDist(cx, cy) * 30; // normalised → km across the map
+  });
+  return +(d.reduce((a, b) => a + b, 0) / d.length).toFixed(1);
 }
 
 // Mean customers per feeder, split urban vs rural by underground share
@@ -237,6 +313,7 @@ function regenerate() {
     seed: $("seed").value || "aotearoa",
     nCust: +$("nCust").value,
     nTowns: +$("nTowns").value,
+    inlandWeight: +$("inland").value / 100,
   };
   const world = generate(params);
   state.world = world;
@@ -257,7 +334,8 @@ function regenerate() {
     `${ohKm.toFixed(0)} km OH / ${ugKm.toFixed(0)} km UG, ` +
     `${world.terrain.bridges.length} bridge(s)`;
   renderChecks();
-  renderSaidi();
+  computeCurves();
+  refreshDerived();
   renderRoadVsLine();
   renderFeederStats(-1);
   $("greedyLog").innerHTML = "";
@@ -295,6 +373,139 @@ function renderSaidi() {
   $("saidiReclosers").textContent = dev.reclosers.size;
   const delta = base.overall - now.overall;
   $("saidiDelta").textContent = fmt(delta);
+}
+
+// ------------------------------------------- diminishing-returns chart
+
+const CURVE_N = 20;
+
+// Knee = point of maximum distance from the chord between the curve's
+// endpoints, in normalised coordinates (a standard elbow heuristic).
+function kneeIndex(pts) {
+  if (pts.length < 3) return -1;
+  const n = pts.length - 1;
+  const y0 = pts[0], y1 = pts[n];
+  if (y0 - y1 < 1e-9) return -1;
+  let best = -1, bestD = -1;
+  for (let k = 1; k < n; k++) {
+    const tx = k / n, ty = (pts[k] - y1) / (y0 - y1);
+    const d = Math.abs(tx + ty - 1) / Math.SQRT2;
+    if (d > bestD) { bestD = d; best = k; }
+  }
+  return best;
+}
+
+function computeCurves() {
+  const { net } = state.world;
+  const mk = (kind) => {
+    const res = greedyPlace(net, CURVE_N, kind, null, state.rateMul);
+    const pts = [res.baseline];
+    for (const l of res.log) if (!l.stopped) pts.push(l.saidiAfter);
+    return pts;
+  };
+  const sw = mk("switch"), rc = mk("recloser");
+  state.curves = { sw, rc, kneeSw: kneeIndex(sw), kneeRc: kneeIndex(rc) };
+}
+
+const CURVE_COL = { sw: "#2a78d6", rc: "#1baf7a" };
+
+function renderCurve() {
+  const c = state.curves;
+  if (!c) return;
+  const W = 340, H = 190, ml = 46, mr = 66, mt = 10, mb = 26;
+  const iw = W - ml - mr, ih = H - mt - mb;
+  const maxY = Math.max(c.sw[0], c.rc[0]) * 1.04;
+  const X = (k) => ml + (k / CURVE_N) * iw;
+  const Y = (v) => mt + ih - (v / maxY) * ih;
+  const path = (pts) => pts.map((v, k) => `${k ? "L" : "M"}${X(k).toFixed(1)},${Y(v).toFixed(1)}`).join("");
+  let grid = "";
+  for (let g = 0; g <= 4; g++) {
+    const v = maxY * g / 4, y = Y(v);
+    grid += `<line x1="${ml}" x2="${W - mr}" y1="${y}" y2="${y}" stroke="#e1e0d9" stroke-width="1"/>` +
+      `<text x="${ml - 5}" y="${y + 3.5}" text-anchor="end" fill="#898781" font-size="10">${Math.round(v)}</text>`;
+  }
+  const knee = (pts, k, col) => k < 1 ? "" :
+    `<circle cx="${X(k)}" cy="${Y(pts[k])}" r="4.5" fill="#fcfcfb" stroke="${col}" stroke-width="2"/>` +
+    `<text x="${X(k)}" y="${Y(pts[k]) - 8}" text-anchor="middle" fill="#52514e" font-size="10">knee ${k}</text>`;
+  const endLabel = (pts, col, name, dy) =>
+    `<text x="${X(pts.length - 1) + 5}" y="${Y(pts[pts.length - 1]) + dy}" fill="${col}" font-size="10.5" font-weight="600">${name}</text>`;
+  // "you are here": the actual placed mix (may combine both device kinds)
+  const dev = currentDevices();
+  const placed = dev.switches.size + dev.reclosers.size;
+  let here = "";
+  if (placed > 0 && placed <= CURVE_N) {
+    const nowSaidi = computeSaidi(state.world.net, dev, state.rateMul).overall;
+    here = `<circle cx="${X(placed)}" cy="${Y(nowSaidi)}" r="4" fill="#0b0b0b"/>` +
+      `<text x="${X(placed) + 6}" y="${Y(nowSaidi) + 3}" fill="#0b0b0b" font-size="10">placed</text>`;
+  }
+  const swLast = c.sw[c.sw.length - 1], rcLast = c.rc[c.rc.length - 1];
+  const labelSpread = Math.abs(Y(swLast) - Y(rcLast)) < 12 ? 12 : 0;
+  $("drChart").innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="SAIDI vs device count">
+      ${grid}
+      <line x1="${ml}" x2="${W - mr}" y1="${Y(0)}" y2="${Y(0)}" stroke="#c3c2b7" stroke-width="1"/>
+      <text x="${(ml + W - mr) / 2}" y="${H - 6}" text-anchor="middle" fill="#898781" font-size="10">devices placed (greedy, from zero)</text>
+      <text x="12" y="${mt + 8}" fill="#898781" font-size="10">min/yr</text>
+      <path d="${path(c.sw)}" fill="none" stroke="${CURVE_COL.sw}" stroke-width="2"/>
+      <path d="${path(c.rc)}" fill="none" stroke="${CURVE_COL.rc}" stroke-width="2"/>
+      ${knee(c.sw, c.kneeSw, CURVE_COL.sw)}
+      ${knee(c.rc, c.kneeRc, CURVE_COL.rc)}
+      ${endLabel(c.sw, CURVE_COL.sw, "switches", Y(swLast) <= Y(rcLast) ? -labelSpread + 3 : labelSpread + 3)}
+      ${endLabel(c.rc, CURVE_COL.rc, "reclosers", Y(rcLast) < Y(swLast) ? -labelSpread + 3 : labelSpread + 3)}
+      ${here}
+      <line id="drCross" x1="0" x2="0" y1="${mt}" y2="${mt + ih}" stroke="#898781" stroke-width="1" opacity="0"/>
+      <rect id="drHover" x="${ml}" y="${mt}" width="${iw}" height="${ih}" fill="transparent"/>
+    </svg>`;
+  const svg = $("drChart").querySelector("svg");
+  const hover = svg.querySelector("#drHover");
+  const cross = svg.querySelector("#drCross");
+  const tip = $("drTip");
+  hover.addEventListener("mousemove", (e) => {
+    const box = svg.getBoundingClientRect();
+    const px = (e.clientX - box.left) / box.width * W;
+    const k = Math.max(0, Math.min(CURVE_N, Math.round((px - ml) / iw * CURVE_N)));
+    cross.setAttribute("x1", X(k)); cross.setAttribute("x2", X(k));
+    cross.setAttribute("opacity", "1");
+    tip.textContent = `${k} device${k === 1 ? "" : "s"}: switches ${fmt(c.sw[Math.min(k, c.sw.length - 1)])} · reclosers ${fmt(c.rc[Math.min(k, c.rc.length - 1)])} min/yr`;
+  });
+  hover.addEventListener("mouseleave", () => {
+    cross.setAttribute("opacity", "0");
+    tip.textContent = "";
+  });
+}
+
+// ------------------------------------------------ feeder league + heat
+
+function renderLeague() {
+  const { net } = state.world;
+  const per = computeSaidi(net, currentDevices(), state.rateMul).perFeeder
+    .slice().sort((a, b) => b.custMin - a.custMin);
+  $("leagueTable").innerHTML =
+    `<tr><th>#</th><th>Feeder</th><th>Cust</th><th>SAIDI</th><th>Cust·min</th></tr>` +
+    per.map((p, i) => {
+      const f = net.feeders.find(f => f.id === p.feeder);
+      return `<tr data-fid="${p.feeder}" class="${state.renderer.selectedFeeder === p.feeder ? "sel" : ""}">` +
+        `<td>${i + 1}</td>` +
+        `<td><span class="chip" style="background:${feederColour(p.feeder)}"></span>F${p.feeder}</td>` +
+        `<td>${f.customers}</td><td>${fmt(p.saidi)}</td><td>${(p.custMin / 1000).toFixed(0)}k</td></tr>`;
+    }).join("");
+}
+
+function updateHeat() {
+  const { net } = state.world;
+  const per = computeSaidi(net, currentDevices(), state.rateMul).perFeeder;
+  const maxCM = Math.max(1, ...per.map(p => p.custMin));
+  const heat = new Map(per.map(p => [p.feeder, p.custMin / maxCM]));
+  state.renderer.updateHeat(state.world, heat);
+}
+
+// One call to refresh everything that depends on devices/rates.
+function refreshDerived() {
+  renderSaidi();
+  renderLeague();
+  updateHeat();
+  renderCurve();
+  renderFeederStats(state.renderer.selectedFeeder);
 }
 
 function renderRoadVsLine() {
@@ -375,8 +586,7 @@ function placeDevices(kind) {
       `SAIDI ${fmt(l.saidiBefore)} → <strong>${fmt(l.saidiAfter)}</strong> ` +
       `(−${fmt(l.benefitMin, 2)} min) ${l.monotone ? "" : "⚠ NON-MONOTONE"}`;
     logEl.prepend(div);
-    renderSaidi();
-    renderFeederStats(state.renderer.selectedFeeder);
+    refreshDerived();
     draw();
     setTimeout(stepIn, 240);
   };
@@ -387,7 +597,7 @@ function resetDevices() {
   state.renderer.switchList = [];
   state.renderer.recloserList = [];
   $("greedyLog").innerHTML = "";
-  renderSaidi();
+  refreshDerived();
   renderChecks();
   draw();
 }
@@ -418,10 +628,15 @@ function toggleDebugRate(on) {
         `node ${dbg.debugPick.node} (F${dbg.debugPick.feeder}) — ` +
         (dbg.moved
           ? `<strong class="ok">pick moved ✓ (benefit is rate-weighted)</strong>`
-          : `<strong class="bad">pick did NOT move ✗</strong>`);
+          : dbg.rateWeighted
+            ? `<strong class="ok">pick held — the baseline pick dominates every ` +
+              `single doubling on this seed, but the boosted branch's benefit ` +
+              `doubled exactly (${(dbg.boostGainDebug / dbg.boostGain).toFixed(3)}×) ✓ rate-weighted</strong>`
+            : `<strong class="bad">boosted benefit did NOT double ✗</strong>`);
     }
   }
-  renderSaidi();
+  computeCurves();
+  refreshDerived();
   draw();
 }
 
@@ -541,10 +756,10 @@ function initUI() {
     $("seed").value = "nz-" + Math.floor(performance.now() * 997 % 100000);
     regenerate();
   });
-  for (const id of ["nCust", "nTowns"]) {
+  for (const id of ["nCust", "nTowns", "inland"]) {
     $(id).addEventListener("input", () => { $(id + "Val").textContent = $(id).value; });
   }
-  for (const layer of ["terrain", "density", "roads", "customers", "network", "txs", "switches", "bridges", "roadVsLine"]) {
+  for (const layer of ["terrain", "density", "roads", "customers", "network", "txs", "switches", "bridges", "roadVsLine", "heat", "subtx"]) {
     const box = $("layer-" + layer);
     if (!box) continue;
     box.checked = state.renderer.layers[layer];
@@ -561,13 +776,24 @@ function initUI() {
       setFaultRates(+$("rateOh").value, +$("rateUg").value);
       // placed devices stay; all figures recompute under the new rates
       state.world.roadVsLine = roadVsLine(state.world.net, state.world.graph);
-      renderSaidi();
+      computeCurves();
+      refreshDerived();
       renderRoadVsLine();
-      renderFeederStats(state.renderer.selectedFeeder);
       renderChecks();
       draw();
     });
   }
+  $("leagueTable").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-fid]");
+    if (!tr) return;
+    const fid = +tr.dataset.fid;
+    state.renderer.selectedFeeder = fid;
+    state.renderer.selectedEdge = -1;
+    state.renderer.zoomToFeeder(state.world, fid);
+    renderFeederStats(fid);
+    renderLeague();
+    draw();
+  });
   $("debugRate").addEventListener("change", (e) => toggleDebugRate(e.target.checked));
   $("faultMode").addEventListener("change", (e) => {
     state.faultMode = e.target.checked;
@@ -578,6 +804,19 @@ function initUI() {
   // assumptions panel
   $("assumptions").innerHTML = ASSUMPTIONS.map(a =>
     `<div class="assumption"><strong>${a.area}</strong> — ${a.text}</div>`).join("");
+
+  // ?on=heat,density&off=roads — preset layers from the URL (handy for
+  // sharing a specific view and for headless screenshots)
+  const qs = new URLSearchParams(location.search);
+  for (const [param, val] of [["on", true], ["off", false]]) {
+    for (const name of (qs.get(param) ?? "").split(",").filter(Boolean)) {
+      if (name in state.renderer.layers) {
+        state.renderer.layers[name] = val;
+        const box = $("layer-" + name);
+        if (box) box.checked = val;
+      }
+    }
+  }
 
   regenerate();
 

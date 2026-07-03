@@ -239,7 +239,7 @@ export function debugRateExperiment(net) {
   const base = ranked[0];
   let chosen = null, tried = 0;
   for (const cand of ranked.slice(1)) {
-    if (tried >= 120) break;
+    if (tried >= 1500) break; // safety valve only — scan is cheap
     const branch = subtreeEdges(net, cand.teId);
     // An ANCESTOR of the base pick can never move it (its boost doubles the
     // base's benefit too); descendants and disjoint branches can.
@@ -255,11 +255,23 @@ export function debugRateExperiment(net) {
     if (moved) break;
   }
   if (!chosen) return { supported: false, reason: "single-candidate network" };
+  // Whether or not the pick moved, the boosted branch's own benefit must
+  // have EXACTLY doubled — the direct proof the score is rate-weighted.
+  // (A dominant baseline pick can survive any single doubling; that is a
+  // property of the network, not of the scoring.)
+  const after = allCandidates(net, emptyDevices(), "switch", chosen.rateMul)
+    .find(c => c.teId === chosen.boostEdge);
+  const boostGainDebug = after ? after.gain : 0;
+  const rateWeighted = chosen.moved ||
+    Math.abs(boostGainDebug - 2 * chosen.boostGain) <= 1e-6 * chosen.boostGain;
+  console.assert(rateWeighted, "boosted branch benefit did not double");
   return {
     supported: true,
     boostEdge: chosen.boostEdge,
     boostNode: chosen.boostNode,
     boostGain: chosen.boostGain,
+    boostGainDebug,
+    rateWeighted,
     boostFeeder: chosen.boostFeeder,
     branch: chosen.branch,
     basePick: base,

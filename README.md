@@ -102,8 +102,24 @@ values work programmatically via `generate()` / `?scaletest=1`.
 - **Road vs straight line** — per-feeder rate-weighted ratio of crew road
   distance to straight-line distance (bridges/terrain push it above 1);
   with the layer on and a section selected the two routes are drawn.
-- Seed input, customer/town sliders, nine layer toggles, click-a-feeder
-  stats, pan/zoom.
+- **Diminishing-returns chart** — network SAIDI vs device count (0–20),
+  switches and reclosers as separate series each placed greedily from a
+  device-free network, knee marked per series (max-distance-from-chord),
+  plus a "placed" marker for your current mix. Live-updates with fault
+  rates and debug mode; hover for exact values.
+- **Feeder league table** — feeders ranked worst-first by customer-minutes
+  per year (SAIDI × customers); click a row to zoom the map to that feeder.
+  The matching "SAIDI heat" layer shades customer cells by the serving
+  feeder's customer-minutes (sequential blue, dark = worst).
+- **Inland town dispersion** — an Inland slider (0–100%) blends town-site
+  scoring from coastal-biased to flat-river-valley-biased, so towns (and
+  everything downstream of them) can settle inland.
+- **Subtransmission overlay** — dashed heavy lines from a plausible GXP
+  (flat map-edge cell near the load centroid) to each zone sub. VISUAL
+  ONLY: a correctness check asserts SAIDI and network structure are
+  identical with and without it.
+- Seed input, customer/town/inland sliders, eleven layer toggles,
+  click-a-feeder stats, pan/zoom.
 
 ## Correctness guards (asserted and reported in the Checks panel)
 

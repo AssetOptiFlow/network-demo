@@ -4,7 +4,7 @@
 export const ASSUMPTIONS = [
   { area: "Geography", text: "30 × 30 km invented map on a 200 m grid; sea along one seed-chosen edge; one river traced high-ground → sea by noisy steepest descent (60–140 m wide). No real data. (terrain.js)" },
   { area: "Geography", text: "Buildable land = main landmass, not water, slope < 0.35 m/m. Customers and roads exist only there. (terrain.js)" },
-  { area: "Towns", text: "Towns seeded at flat, coastal-biased sites ≥ 4 km apart; density = per-town Gaussians × fBm noise (same noise family as terrain). (density.js)" },
+  { area: "Towns", text: "Towns seeded at flat sites ≥ 4 km apart, scored by a coastal-vs-inland blend set by the Inland slider (0% = classic coastal towns, 100% = flat river-valley towns); density = per-town Gaussians × fBm noise (same noise family as terrain). (density.js)" },
   { area: "Roads", text: "Arterials = MST between towns + one loop link, A*-routed with slope-squared cost multiplier (capped 9×); sea impassable; first river crossing builds a bridge (28× penalty), later roads reuse it (1.3×). (roads.js)" },
   { area: "Roads", text: "Urban streets: rotated lattice, 130–165 m spacing, kept where town Gaussian is high; every 4th line is a collector. Rural: A* spurs to customer clusters > 350 m from a road. (roads.js)" },
   { area: "Electrical", text: "Distribution transformers: greedy capacitated clustering, ≤ 50 customers, gathered within 500 m urban / 1500 m rural; TX at road node nearest centroid. LV below the TX not modelled. (network.js)" },
@@ -16,5 +16,8 @@ export const ASSUMPTIONS = [
   { area: "Reliability", text: "Sectionalising: open deepest upstream switch, reclose the tripped device; everyone else in the tripped zone restored after a flat 45 min. Flat time makes greedy placement provably monotone. Radial — no backfeed. (reliability.js)" },
   { area: "Reliability", text: "Reclosers are ideal protection: a fault downstream is cleared by the recloser, customers upstream see NO sustained interruption. Momentary interruptions (SAIFI/MAIFI), fuse saving and protection coordination limits are NOT modelled. (reliability.js)" },
   { area: "Reliability", text: "Baseline is device-free: one breaker per feeder, no fuses. One device per line section." },
+  { area: "Reliability", text: "Diminishing-returns chart: each series places its device kind greedily from a DEVICE-FREE network (not on top of the other kind); knee = max distance from the endpoint chord. (main.js)" },
+  { area: "Visual", text: "Subtransmission overlay (GXP → zone subs) is VISUAL ONLY — the GXP is a flat map-edge cell near the load centroid, the lines are decoration, and a check asserts SAIDI and network structure are byte-identical with the overlay computed. (main.js, render.js)" },
+  { area: "Visual", text: "SAIDI heat layer shades each customer cell by the serving feeder's customer-minutes, normalised to the current worst feeder (dark = worst). It is a view of the league table, not an input to anything. (render.js)" },
   { area: "General", text: "Plausible, not optimal — greedy/heuristic everywhere, matching the untidy way real networks accrete. Seeded and deterministic throughout." },
 ];

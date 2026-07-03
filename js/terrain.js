@@ -261,6 +261,18 @@ export class Terrain {
     }
   }
 
+  // Straight-line distance (m) to the nearest river path point.
+  riverDistAt(x, y) {
+    const rp = this.riverPath;
+    if (rp.length === 0) return Infinity;
+    let bd = Infinity;
+    for (let i = 0; i < rp.length; i += 3) {
+      const d = (rp[i].x - x) ** 2 + (rp[i].y - y) ** 2;
+      if (d < bd) bd = d;
+    }
+    return Math.sqrt(bd);
+  }
+
   // Which bank of the river a point is on: +1 / -1 (sign of the cross
   // product against the nearest river segment). Used to seed towns on
   // both banks so bridges actually happen.

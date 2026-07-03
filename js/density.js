@@ -1,9 +1,11 @@
 // density.js — seed towns + Gaussian falloff + noise → customer density.
 //
 // ASSUMPTIONS:
-//  - Towns are seeded at buildable sites scored for flatness and coastal
-//    proximity (NZ towns hug the flat coastal strips), with a minimum
-//    4 km separation.
+//  - Towns are seeded at buildable sites scored for flatness plus a blend
+//    of coastal proximity and river proximity, with a minimum 4 km
+//    separation. The "inland weighting" slider (0–100%) shifts the blend:
+//    0 = classic coastal towns, 100 = flat river-valley towns (roads
+//    follow later either way, so inland towns still get arterials).
 //  - Density = sum of per-town Gaussians, modulated by fBm noise from the
 //    SAME noise family as the terrain (different fork), zeroed off
 //    buildable land. Purely relative units.
@@ -11,9 +13,10 @@
 import { fbm01 } from "./noise.js";
 import { GRID_N, MAP_SIZE } from "./terrain.js";
 
-export function seedTowns(terrain, rng, nTowns) {
+export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25) {
   const cand = [];
   const r = rng.fork("townsites");
+  const w = Math.max(0, Math.min(1, inlandWeight));
   for (let k = 0; k < 900; k++) {
     const x = r.range(1500, MAP_SIZE - 1500);
     const y = r.range(1500, MAP_SIZE - 1500);
@@ -22,7 +25,11 @@ export function seedTowns(terrain, rng, nTowns) {
     const slope = terrain.slope[terrain.idx(cx, cy)];
     const coast = terrain._coastDist(cx, cy); // 0 at coast
     const flat = 1 - Math.min(1, slope / 0.35);
-    const score = flat * 1.1 + Math.exp(-coast * 4.5) * 1.5 + r.float() * 0.5;
+    const coastBonus = Math.exp(-coast * 4.5);
+    const riverBonus = Math.exp(-terrain.riverDistAt(x, y) / 2500);
+    const score = flat * 1.1 +
+      ((1 - w) * coastBonus + w * (riverBonus + flat * 0.4)) * 1.5 +
+      r.float() * 0.5;
     cand.push({ x, y, score });
   }
   cand.sort((a, b) => b.score - a.score);

@@ -25,8 +25,9 @@ export class Renderer {
     this.layers = {
       terrain: true, density: false, roads: true, customers: true,
       network: true, txs: false, switches: true, bridges: true,
-      roadVsLine: false,
+      roadVsLine: false, heat: false, subtx: true,
     };
+    this._heatCache = null;
     this.world = null;
     this.selectedFeeder = -1;
     this.selectedEdge = -1;
@@ -47,6 +48,7 @@ export class Renderer {
     this.recloserList = [];
     this._terrainCache = this._renderTerrainCache(world.terrain);
     this._densityCache = this._renderDensityCache(world);
+    this._heatCache = null; // rebuilt via updateHeat once SAIDI is computed
     this.fit();
   }
 
@@ -145,8 +147,14 @@ export class Renderer {
       ctx.drawImage(this._terrainCache, px, py, sz, sz);
     }
     if (this.layers.density) ctx.drawImage(this._densityCache, px, py, sz, sz);
+    if (this.layers.heat && this._heatCache) {
+      ctx.imageSmoothingEnabled = false; // crisp cells for the heat layer
+      ctx.drawImage(this._heatCache, px, py, sz, sz);
+      ctx.imageSmoothingEnabled = true;
+    }
     if (this.layers.roads) this._drawRoads();
     if (this.layers.customers) this._drawCustomers();
+    if (this.layers.subtx) this._drawSubtx();
     if (this.layers.network) this._drawNetwork();
     if (this.layers.roadVsLine) this._drawRoadVsLine();
     this._drawSubsAndTxs();
@@ -354,6 +362,85 @@ export class Renderer {
     ctx.moveTo(x - r, y - r); ctx.lineTo(x + r, y + r);
     ctx.moveTo(x - r, y + r); ctx.lineTo(x + r, y - r);
     ctx.stroke();
+  }
+
+  // Heat layer: per-cell max of the serving feeder's normalised
+  // customer-minutes (sequential blue ramp — dark = worst).
+  updateHeat(world, heatByFeeder) {
+    const n = GRID_N;
+    const vals = new Float32Array(n * n).fill(-1);
+    for (const c of world.customers) {
+      const tx = world.net.txs[c.tx];
+      if (!tx || tx.feeder < 0) continue;
+      const v = heatByFeeder.get(tx.feeder) ?? 0;
+      const [cx, cy] = world.terrain.cellOf(c.x, c.y);
+      const i = cy * n + cx;
+      if (v > vals[i]) vals[i] = v;
+    }
+    const off = document.createElement("canvas");
+    off.width = n; off.height = n;
+    const ctx2 = off.getContext("2d");
+    const img = ctx2.createImageData(n, n);
+    const c0 = [205, 226, 251], c1 = [13, 54, 107]; // palette blue 100→700
+    for (let i = 0; i < n * n; i++) {
+      const v = vals[i];
+      if (v < 0) continue;
+      img.data[i * 4] = c0[0] + (c1[0] - c0[0]) * v;
+      img.data[i * 4 + 1] = c0[1] + (c1[1] - c0[1]) * v;
+      img.data[i * 4 + 2] = c0[2] + (c1[2] - c0[2]) * v;
+      img.data[i * 4 + 3] = 120 + 110 * v;
+    }
+    ctx2.putImageData(img, 0, 0);
+    this._heatCache = off;
+  }
+
+  // Subtransmission overlay: GXP → zone subs. VISUAL ONLY — the model
+  // never reads these lines; asserted in the checks panel.
+  _drawSubtx() {
+    const { ctx, world } = this;
+    if (!world.gxp) return;
+    const g = world.gxp;
+    ctx.strokeStyle = "#3a3935";
+    ctx.lineWidth = Math.max(2.2, this.view.scale * 90);
+    ctx.setLineDash([11, 7]);
+    ctx.beginPath();
+    for (const sub of world.net.subs) {
+      ctx.moveTo(this.sx(g.x), this.sy(g.y));
+      ctx.lineTo(this.sx(sub.x), this.sy(sub.y));
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const r = Math.max(6, this.view.scale * 190);
+    ctx.fillStyle = "#3a3935";
+    ctx.fillRect(this.sx(g.x) - r, this.sy(g.y) - r, r * 2, r * 2);
+    ctx.strokeStyle = "#fcfcfb";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(this.sx(g.x) - r * 0.55, this.sy(g.y) - r * 0.55, r * 1.1, r * 1.1);
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.fillStyle = "#3a3935";
+    ctx.textAlign = "center";
+    ctx.fillText("GXP — subtransmission (visual only)", this.sx(g.x), this.sy(g.y) - r - 5);
+  }
+
+  // Fit the view to one feeder's extent (plus its sub), with margin.
+  zoomToFeeder(world, fid) {
+    const net = world.net, g = world.graph;
+    const f = net.feeders.find(f => f.id === fid);
+    if (!f) return;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    const grow = (x, y) => {
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+      x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+    };
+    for (const v of f.nodes) grow(g.nx[v], g.ny[v]);
+    const sub = net.subs[f.sub];
+    grow(sub.x, sub.y);
+    const w = Math.max(1500, x1 - x0), h = Math.max(1500, y1 - y0);
+    const { width, height } = this.canvas;
+    const s = Math.min(0.5, Math.min(width / w, height / h) * 0.78);
+    this.view.scale = s;
+    this.view.ox = width / 2 - (x0 + x1) / 2 * s;
+    this.view.oy = height / 2 - (y0 + y1) / 2 * s;
   }
 
   _drawTownLabels() {
