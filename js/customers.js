@@ -1,4 +1,7 @@
-// customers.js — weighted sampling of customer sites from the density grid.
+// customers.js — the LOAD layer: weighted sampling of customer sites from
+// the density field (which already encodes settlement Gaussians and
+// roadside rural decay), then snapping to the finished road graph.
+// STRICT LAYER ORDER: load depends on terrain + settlements + roads.
 //
 // ASSUMPTIONS:
 //  - Each customer is an independent point (ICP) drawn from the density
@@ -8,7 +11,7 @@
 
 import { CELL, GRID_N } from "./terrain.js";
 
-export function sampleCustomers(terrain, density, nCust, rng) {
+export function sampleCustomers(terrain, density, graph, nCust, rng) {
   const n = GRID_N;
   const { grid } = density;
   // Cumulative distribution over cells.
@@ -23,7 +26,6 @@ export function sampleCustomers(terrain, density, nCust, rng) {
   let guard = 0;
   while (customers.length < nCust && guard++ < nCust * 30) {
     const target = r.float() * total;
-    // binary search
     let lo = 0, hi = n * n - 1;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
@@ -35,5 +37,16 @@ export function sampleCustomers(terrain, density, nCust, rng) {
     if (!terrain.buildableAt(x, y)) continue;
     customers.push({ x, y, density: grid[lo], node: -1, tx: -1 });
   }
-  return customers;
+  // Snap each customer to its nearest road node (service point).
+  let maxSnap = 0, sumSnap = 0;
+  for (const c of customers) {
+    const near = graph.nearestNode(c.x, c.y, 30000);
+    c.node = near.id;
+    maxSnap = Math.max(maxSnap, near.dist);
+    sumSnap += near.dist;
+  }
+  return {
+    customers,
+    snapStats: { max: maxSnap, mean: sumSnap / Math.max(1, customers.length) },
+  };
 }

@@ -20,16 +20,15 @@
 //  - LV detail below the TX is ignored; customers hang off their TX.
 
 export const TX_CAP = 50;
-export const UG_DENSITY_THRESH = 0.30; // density units — inner-urban ⇒ cable
-// Zone-sub siting rules (greedy facility location over road distance):
-//  - an urban sub serves at most ~4000 customers (overloaded regions split)
-//  - a rural sub is justified by as few as 500 customers IF it saves them
-//    ≥ 2 km of road distance each on average
+// Town peaks sit near 1.0 (mass-compensated), so this keeps cable to the
+// inner core (roughly r < σ) rather than whole towns.
+export const UG_DENSITY_THRESH = 0.55; // density units — inner-urban ⇒ cable
+// Zone-sub sizing rules (k selection for the catchment k-means):
+//  - an urban sub serves at most ~4000 customers (oversize catchments split)
+//  - a rural sub can serve as few as 500 (smaller catchments merge)
 const SUB_MAX_CUST = 4000;
 const SUB_MIN_CUST = 500;
-const SUB_MIN_SAVING_M = 2000;
 const MAX_SUBS = 10;
-const SUB_MIN_SEP_M = 2000;
 // Cut targets are set above the desired averages (rural ~250, urban ~700,
 // overall ~400) because overshoot-at-cut and small branch-root remainders
 // pull realised feeder sizes below the cut threshold.
@@ -54,15 +53,15 @@ function feederTarget(cust, lenM, ugLenM) {
   return FEEDER_TARGET_RURAL + u * (FEEDER_TARGET_URBAN - FEEDER_TARGET_RURAL);
 }
 
-export function buildNetwork(terrain, graph, customers, towns, density, rng) {
+// STRICT LAYER ORDER: subs are placed FIRST (k-means catchments over the
+// load, see placeSubs) and passed in; feeders are the LAST layer, grown
+// from the subs over the road graph.
+export function buildNetwork(terrain, graph, customers, towns, density, subs, rng) {
   // ---------- 1. capacitated TX clustering (greedy, deterministic)
   const txs = clusterTransformers(customers, rng);
   for (const tx of txs) {
     tx.node = graph.nearestNode(tx.x, tx.y, 30000).id;
   }
-
-  // ---------- 2. zone substations: greedy facility location
-  const subs = placeSubs(graph, customers, towns);
 
   // ---------- 3. multi-source Dijkstra over road graph
   const nN = graph.nNodes;
@@ -324,114 +323,63 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   };
 }
 
-// Zone subs by greedy facility location (weighted 1-median over ROAD
-// distance). Candidate sites = road nodes of the top load bins. The first
-// sub minimises total customer·distance; each further sub is the candidate
-// saving the most customer·distance, ACCEPTED only if it captures ≥500
-// customers and either saves them ≥2 km each on average (a worthwhile
-// rural sub) or relieves a sub serving >4000 (an urban split).
-function placeSubs(graph, customers, towns) {
-  const nN = graph.nNodes;
-  const custAtNode = new Float64Array(nN);
-  for (const c of customers) if (c.node >= 0) custAtNode[c.node] += 1;
-  const loaded = [];
-  for (let v = 0; v < nN; v++) if (custAtNode[v] > 0) loaded.push(v);
-
-  // candidate sites from 1.2 km load bins
-  const BIN = 1200;
-  const bins = new Map();
-  for (const c of customers) {
-    const k = ((c.x / BIN) | 0) * 8192 + ((c.y / BIN) | 0);
-    let b = bins.get(k);
-    if (!b) bins.set(k, b = { x: 0, y: 0, n: 0 });
-    b.x += c.x; b.y += c.y; b.n++;
-  }
-  const binList = [...bins.values()]
-    .map(b => ({ x: b.x / b.n, y: b.y / b.n, n: b.n }))
-    .sort((a, b) => b.n - a.n || a.x - b.x || a.y - b.y);
-  // Coverage candidates: the top bins are all in towns, which would leave
-  // sparse districts with no candidate site at all — so also nominate the
-  // densest bin of every 6 km super-cell holding ≥200 customers.
-  const SUPER = 6000;
-  const superCells = new Map(); // key -> {total, best}
-  for (const b of binList) {
-    const sk = ((b.x / SUPER) | 0) * 128 + ((b.y / SUPER) | 0);
-    let sc = superCells.get(sk);
-    if (!sc) superCells.set(sk, sc = { total: 0, best: null });
-    sc.total += b.n;
-    if (!sc.best || b.n > sc.best.n) sc.best = b;
-  }
-  const candBins = binList.slice(0, 60);
-  for (const sc of superCells.values()) {
-    if (sc.total >= 200) candBins.push(sc.best);
-  }
-  const candNodes = [];
-  const seen = new Set();
-  for (const b of candBins) {
-    const near = graph.nearestNode(b.x, b.y, 30000);
-    if (near.id !== -1 && !seen.has(near.id)) { seen.add(near.id); candNodes.push(near.id); }
-  }
-
-  // road-distance field from every candidate (reused across greedy steps)
-  const fields = candNodes.map(node => dijkstraField(graph, node));
-
-  const chosenIdx = [];
-  const curDist = new Float64Array(nN).fill(Infinity); // to nearest chosen sub
-  const regionOf = new Int32Array(nN).fill(-1);
-  const regionCust = [];
-  while (chosenIdx.length < MAX_SUBS) {
-    let best = -1, bestSaving = -Infinity, bestCaptured = 0;
-    for (let ci = 0; ci < candNodes.length; ci++) {
-      if (chosenIdx.includes(ci)) continue;
-      if (chosenIdx.some(j => Math.hypot(
-        graph.nx[candNodes[j]] - graph.nx[candNodes[ci]],
-        graph.ny[candNodes[j]] - graph.ny[candNodes[ci]]) < SUB_MIN_SEP_M)) continue;
-      let saving = 0, captured = 0;
-      for (const v of loaded) {
-        const d = fields[ci][v];
-        if (d < curDist[v]) {
-          captured += custAtNode[v];
-          saving += custAtNode[v] * ((curDist[v] === Infinity ? 60000 : curDist[v]) - d);
-        }
+// Zone subs = LOAD CATCHMENTS. STRICT LAYER ORDER: k-means over the
+// customer points (Lloyd, deterministic farthest-point seeding); k adapts
+// until no catchment exceeds SUB_MAX_CUST (urban split) and none that can
+// be merged sits below SUB_MIN_CUST. Each sub is placed at its catchment's
+// LOAD-WEIGHTED CENTROID, then nudged to the nearest subtransmission-
+// viable road node (on an arterial/collector corridor, low slope) —
+// never a geometric centre, never a town marker.
+export function placeSubs(terrain, graph, customers, towns) {
+  const N = customers.length;
+  const k = Math.max(1, Math.min(MAX_SUBS, Math.round(N / 2500)));
+  let clusters = lloydClusters(customers, k);
+  // Targeted fix-ups (global k bumps can ping-pong when one catchment is
+  // oversize and another undersize at the same time): split any catchment
+  // over SUB_MAX_CUST in two, merge any under SUB_MIN_CUST into its
+  // nearest neighbour. Deterministic, bounded passes.
+  for (let pass = 0; pass < 8; pass++) {
+    clusters.sort((a, b) => b.members.length - a.members.length);
+    const over = clusters.find(c => c.members.length > SUB_MAX_CUST);
+    if (over && clusters.length < MAX_SUBS) {
+      clusters = clusters.filter(c => c !== over)
+        .concat(splitCluster(customers, over));
+      continue;
+    }
+    const under = clusters.length > 1
+      ? clusters.slice().sort((a, b) => a.members.length - b.members.length)
+        .find(c => c.members.length < SUB_MIN_CUST)
+      : null;
+    if (under) {
+      let near = null, nd = Infinity;
+      for (const c of clusters) {
+        if (c === under) continue;
+        const d = Math.hypot(c.cx - under.cx, c.cy - under.cy);
+        if (d < nd) { nd = d; near = c; }
       }
-      if (saving > bestSaving) { bestSaving = saving; best = ci; bestCaptured = captured; }
+      near.members = near.members.concat(under.members);
+      recentre(customers, near);
+      clusters = clusters.filter(c => c !== under);
+      continue;
     }
-    if (best === -1) break;
-    if (chosenIdx.length > 0) {
-      const meanSaving = bestSaving / Math.max(1, bestCaptured);
-      const overloaded = regionCust.some(n => n > SUB_MAX_CUST);
-      const worthIt = bestCaptured >= SUB_MIN_CUST &&
-        (meanSaving >= SUB_MIN_SAVING_M || overloaded);
-      if (!worthIt) break;
-    }
-    // accept: update assignment
-    const si = chosenIdx.length;
-    chosenIdx.push(best);
-    regionCust.push(0);
-    for (const v of loaded) {
-      const d = fields[best][v];
-      if (d < curDist[v]) {
-        if (regionOf[v] >= 0) regionCust[regionOf[v]] -= custAtNode[v];
-        curDist[v] = d;
-        regionOf[v] = si;
-        regionCust[si] += custAtNode[v];
-      }
-    }
+    break;
   }
-
-  // name subs for the nearest town
   const subs = [];
-  for (const ci of chosenIdx) {
-    const node = candNodes[ci];
-    const x = graph.nx[node], y = graph.ny[node];
+  for (const cl of clusters) {
+    cl.count = cl.members.length;
+    if (!cl.count) continue;
+    const node = nudgeToCorridor(terrain, graph, cl.cx, cl.cy, subs);
+    if (node === -1) continue;
     let town = towns[0], bd = Infinity;
     for (const t of towns) {
-      const d = Math.hypot(t.x - x, t.y - y);
+      const d = Math.hypot(t.x - cl.cx, t.y - cl.cy);
       if (d < bd) { bd = d; town = t; }
     }
     const dupes = subs.filter(s => s.baseName === town.name).length;
     subs.push({
-      id: subs.length, node, x, y,
+      id: subs.length, node,
+      x: graph.nx[node], y: graph.ny[node],
+      centroidX: cl.cx, centroidY: cl.cy, catchment: cl.count,
       baseName: town.name,
       name: town.name + (dupes ? " " + "BCDEFG"[dupes - 1] : ""),
     });
@@ -439,21 +387,119 @@ function placeSubs(graph, customers, towns) {
   return subs;
 }
 
-function dijkstraField(graph, source) {
-  const dist = new Float64Array(graph.nNodes).fill(Infinity);
-  const heap = new NodeHeap();
-  dist[source] = 0;
-  heap.push(0, source);
-  while (heap.size) {
-    const v = heap.pop();
-    for (const ei of graph.adj[v]) {
-      const e = graph.edges[ei];
-      const w = e.a === v ? e.b : e.a;
-      const nd = dist[v] + e.len;
-      if (nd < dist[w] - 1e-9) { dist[w] = nd; heap.push(nd, w); }
+// Deterministic Lloyd k-means over customer points (weight 1 per ICP).
+// Seeding: the overall load centroid's nearest customer, then repeated
+// farthest-point picks (no randomness → same seed, same catchments).
+function lloydClusters(customers, k) {
+  const N = customers.length;
+  let mx = 0, my = 0;
+  for (const c of customers) { mx += c.x; my += c.y; }
+  mx /= N; my /= N;
+  const cent = [];
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < N; i++) {
+    const d = (customers[i].x - mx) ** 2 + (customers[i].y - my) ** 2;
+    if (d < bd) { bd = d; best = i; }
+  }
+  cent.push([customers[best].x, customers[best].y]);
+  const minD = new Float64Array(N).fill(Infinity);
+  while (cent.length < k) {
+    let far = 0, fd = -1;
+    const [lx, ly] = cent[cent.length - 1];
+    for (let i = 0; i < N; i++) {
+      const d = (customers[i].x - lx) ** 2 + (customers[i].y - ly) ** 2;
+      if (d < minD[i]) minD[i] = d;
+      if (minD[i] > fd) { fd = minD[i]; far = i; }
+    }
+    cent.push([customers[far].x, customers[far].y]);
+  }
+  const assign = new Int32Array(N);
+  for (let iter = 0; iter < 10; iter++) {
+    for (let i = 0; i < N; i++) {
+      let a = 0, ad = Infinity;
+      for (let c = 0; c < cent.length; c++) {
+        const d = (customers[i].x - cent[c][0]) ** 2 + (customers[i].y - cent[c][1]) ** 2;
+        if (d < ad) { ad = d; a = c; }
+      }
+      assign[i] = a;
+    }
+    const sx = new Float64Array(cent.length), sy = new Float64Array(cent.length);
+    const cnt = new Int32Array(cent.length);
+    for (let i = 0; i < N; i++) {
+      sx[assign[i]] += customers[i].x; sy[assign[i]] += customers[i].y; cnt[assign[i]]++;
+    }
+    for (let c = 0; c < cent.length; c++) {
+      if (cnt[c]) { cent[c][0] = sx[c] / cnt[c]; cent[c][1] = sy[c] / cnt[c]; }
     }
   }
-  return dist;
+  const out = cent.map(([cx, cy]) => ({ cx, cy, members: [] }));
+  for (let i = 0; i < N; i++) out[assign[i]].members.push(i);
+  return out.filter(c => c.members.length > 0);
+}
+
+function recentre(customers, cl) {
+  let sx = 0, sy = 0;
+  for (const i of cl.members) { sx += customers[i].x; sy += customers[i].y; }
+  cl.cx = sx / cl.members.length;
+  cl.cy = sy / cl.members.length;
+}
+
+// Deterministic 2-means split of an oversize catchment.
+function splitCluster(customers, cl) {
+  const ms = cl.members;
+  // seeds: member nearest the centroid, member farthest from it
+  let a = ms[0], ad = Infinity, b = ms[0], bd = -1;
+  for (const i of ms) {
+    const d = (customers[i].x - cl.cx) ** 2 + (customers[i].y - cl.cy) ** 2;
+    if (d < ad) { ad = d; a = i; }
+    if (d > bd) { bd = d; b = i; }
+  }
+  let ca = [customers[a].x, customers[a].y], cb = [customers[b].x, customers[b].y];
+  let ga = [], gb = [];
+  for (let iter = 0; iter < 8; iter++) {
+    ga = []; gb = [];
+    for (const i of ms) {
+      const da = (customers[i].x - ca[0]) ** 2 + (customers[i].y - ca[1]) ** 2;
+      const db = (customers[i].x - cb[0]) ** 2 + (customers[i].y - cb[1]) ** 2;
+      (da <= db ? ga : gb).push(i);
+    }
+    for (const [g, c] of [[ga, ca], [gb, cb]]) {
+      if (!g.length) continue;
+      let sx = 0, sy = 0;
+      for (const i of g) { sx += customers[i].x; sy += customers[i].y; }
+      c[0] = sx / g.length; c[1] = sy / g.length;
+    }
+  }
+  const mk = (g, c) => ({ cx: c[0], cy: c[1], members: g });
+  return [mk(ga, ca), mk(gb, cb)].filter(c => c.members.length > 0);
+}
+
+// Nudge a load centroid to the nearest subtransmission-viable road node:
+// prefer nodes on an arterial/collector corridor with gentle slope.
+function nudgeToCorridor(terrain, graph, cx, cy, existingSubs) {
+  let best = -1, bestScore = Infinity;
+  const R = 2500;
+  const bx = (cx / 250) | 0, by = (cy / 250) | 0;
+  const rings = Math.ceil(R / 250) + 1;
+  for (let dy = -rings; dy <= rings; dy++) {
+    for (let dx = -rings; dx <= rings; dx++) {
+      const arr = graph.hash.get((bx + dx) * 4096 + (by + dy));
+      if (!arr) continue;
+      for (const id of arr) {
+        if (existingSubs.some(s => s.node === id)) continue;
+        const d = Math.hypot(graph.nx[id] - cx, graph.ny[id] - cy);
+        if (d > R) continue;
+        const onTrunk = graph.adj[id].some(ei => graph.edges[ei].cls <= 1);
+        const score = d + (onTrunk ? 0 : 1400) +
+          terrain.slopeAt(graph.nx[id], graph.ny[id]) * 20000;
+        if (score < bestScore) { bestScore = score; best = id; }
+      }
+    }
+  }
+  if (best !== -1) return best;
+  const near = graph.nearestNode(cx, cy, 30000,
+    (id) => !existingSubs.some(s => s.node === id));
+  return near.id;
 }
 
 class NodeHeap {

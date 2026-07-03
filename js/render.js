@@ -394,22 +394,27 @@ export class Renderer {
     this._heatCache = off;
   }
 
-  // Subtransmission overlay: GXP → zone subs. VISUAL ONLY — the model
-  // never reads these lines; asserted in the checks panel.
+  // Subtransmission overlay: routed GXP → zone-sub lines (shared trunks)
+  // plus the inter-sub tie. VISUAL ONLY — the model never reads these
+  // lines; asserted in the checks panel.
   _drawSubtx() {
     const { ctx, world } = this;
-    if (!world.gxp) return;
-    const g = world.gxp;
-    ctx.strokeStyle = "#3a3935";
-    ctx.lineWidth = Math.max(2.2, this.view.scale * 90);
-    ctx.setLineDash([11, 7]);
-    ctx.beginPath();
-    for (const sub of world.net.subs) {
-      ctx.moveTo(this.sx(g.x), this.sy(g.y));
-      ctx.lineTo(this.sx(sub.x), this.sy(sub.y));
+    const st = world.subtx;
+    if (!st || !st.gxp) return;
+    for (const line of st.lines) {
+      const tie = line.kind === "tie";
+      ctx.strokeStyle = tie ? "#6b6a64" : "#3a3935";
+      ctx.lineWidth = Math.max(tie ? 1.6 : 2.2, this.view.scale * (tie ? 60 : 90));
+      ctx.setLineDash(tie ? [4, 5] : [11, 7]);
+      ctx.beginPath();
+      ctx.moveTo(this.sx(line.pts[0][0]), this.sy(line.pts[0][1]));
+      for (let i = 1; i < line.pts.length; i++) {
+        ctx.lineTo(this.sx(line.pts[i][0]), this.sy(line.pts[i][1]));
+      }
+      ctx.stroke();
     }
-    ctx.stroke();
     ctx.setLineDash([]);
+    const g = st.gxp;
     const r = Math.max(6, this.view.scale * 190);
     ctx.fillStyle = "#3a3935";
     ctx.fillRect(this.sx(g.x) - r, this.sy(g.y) - r, r * 2, r * 2);

@@ -353,4 +353,27 @@ export class Terrain {
   }
 }
 
+// Grid BFS distance (metres, 4-connected, not through ocean) from a seed
+// cell set — shared by the density field (road distance) and siting code.
+export function bfsDistanceM(terrain, seedCells) {
+  const n = terrain.n;
+  const dist = new Float32Array(n * n).fill(Infinity);
+  let frontier = [];
+  for (const c of seedCells) { dist[c] = 0; frontier.push(c); }
+  while (frontier.length) {
+    const next = [];
+    for (const i of frontier) {
+      const cx = i % n, cy = (i / n) | 0;
+      for (const [ax, ay] of [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]]) {
+        if (ax < 0 || ay < 0 || ax >= n || ay >= n) continue;
+        const j = ay * n + ax;
+        if (terrain.water[j] === 1) continue;
+        if (dist[j] > dist[i] + CELL) { dist[j] = dist[i] + CELL; next.push(j); }
+      }
+    }
+    frontier = next;
+  }
+  return dist;
+}
+
 export { SLOPE_BUILD_MAX, ELEV_SCALE_M };

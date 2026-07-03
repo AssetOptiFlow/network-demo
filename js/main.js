@@ -4,8 +4,9 @@ import { RNG } from "./rng.js";
 import { Terrain, MAP_SIZE } from "./terrain.js";
 import { seedTowns, buildDensityGrid } from "./density.js";
 import { sampleCustomers } from "./customers.js";
-import { buildRoads } from "./roads.js";
-import { buildNetwork } from "./network.js";
+import { buildRoads, roadDistanceGrid } from "./roads.js";
+import { buildNetwork, placeSubs } from "./network.js";
+import { buildSubtx } from "./subtx.js";
 import {
   computeSaidi, greedyPlace, allCandidates, debugRateExperiment,
   faultScenario, roadVsLine, emptyDevices, setFaultRates, faultRates,
@@ -17,7 +18,22 @@ import { Renderer, feederColour, STATUS } from "./render.js";
 
 // ------------------------------------------------------------ generation
 
-export function generate(params) {
+// ---- Validation thresholds (named for tuning). A world failing any rule
+// is regenerated on a deterministic retry seed; after MAX_ATTEMPTS the
+// BEST attempt (fewest failures) is used and the unresolved reasons are
+// reported — never a hard fail.
+export const VALIDATION = {
+  MAX_SUB_CENTROID_KM: 5,    // X: sub farther than this from its load centroid
+  MAX_SUBTX_STRAIGHT_KM: 6,  // Y: subtx line straight for longer than this
+  MIN_GRID_SPREAD_DEG: 15,   // all town grids within this spread = suspicious
+  MIN_ZIPF_RATIO: 3.0,       // realised largest/median town size below this = too uniform
+  MAX_ATTEMPTS: 4,
+};
+
+// STRICT LAYER ORDER — each layer consumes only earlier layers:
+//   terrain → settlements (+ provisional corridors) → roads → load →
+//   substation catchments → subtransmission → feeders.
+function generateOnce(params) {
   const t0 = performance.now();
   const rng = new RNG(params.seed);
   const timings = {};
@@ -28,73 +44,150 @@ export function generate(params) {
   mark("terrain", t);
 
   t = performance.now();
-  const towns = seedTowns(terrain, rng.fork("towns"), params.nTowns, params.inlandWeight ?? 0.25);
-  const density = buildDensityGrid(terrain, towns, rng.fork("density"));
-  mark("density", t);
+  const { towns, corridors } = seedTowns(terrain, rng.fork("towns"), params.nTowns, params.inlandWeight ?? 0.25);
+  mark("settlements", t);
 
   t = performance.now();
-  const customers = sampleCustomers(terrain, density, params.nCust, rng.fork("cust"));
-  mark("customers", t);
-
-  t = performance.now();
-  const { graph, repair, snapStats } = buildRoads(terrain, towns, customers, rng.fork("roads"));
+  const { graph, repair } = buildRoads(terrain, towns, corridors, rng.fork("roads"));
+  const roadDistM = roadDistanceGrid(terrain, graph);
   mark("roads", t);
 
   t = performance.now();
-  const net = buildNetwork(terrain, graph, customers, towns, density, rng.fork("net"));
-  mark("network", t);
+  const density = buildDensityGrid(terrain, towns, roadDistM, rng.fork("density"));
+  const { customers, snapStats } = sampleCustomers(terrain, density, graph, params.nCust, rng.fork("cust"));
+  mark("load", t);
+
+  t = performance.now();
+  const subs = placeSubs(terrain, graph, customers, towns);
+  mark("catchments", t);
+
+  t = performance.now();
+  let lx = 0, ly = 0;
+  for (const c of customers) { lx += c.x; ly += c.y; }
+  const loadCentroid = { x: lx / Math.max(1, customers.length), y: ly / Math.max(1, customers.length) };
+  const subtx = buildSubtx(terrain, subs, loadCentroid, roadDistM);
+  mark("subtx", t);
+
+  t = performance.now();
+  const net = buildNetwork(terrain, graph, customers, towns, density, subs, rng.fork("net"));
+  mark("feeders", t);
 
   const world = {
-    params, terrain, towns, density, customers, graph, net,
-    roadRepair: repair, snapStats,
+    params, terrain, towns, corridors, density, customers, graph, net, subtx,
+    roadRepair: repair, snapStats, roadDistM,
   };
   t = performance.now();
   world.checks = runChecks(world);
   world.roadVsLine = roadVsLine(net, graph);
 
-  // Subtransmission overlay: GXP site + lines to zone subs. VISUAL ONLY —
-  // asserted, not assumed: SAIDI and network structure must be identical
-  // before and after the overlay is computed.
+  // Subtransmission is VISUAL ONLY — asserted, not assumed: rebuilding it
+  // must leave SAIDI, the road graph and the feeder structure untouched.
   const saidiBefore = computeSaidi(net, emptyDevices()).overall;
-  const edgesBefore = net.treeEdges.length, feedersBefore = net.feeders.length;
-  world.gxp = pickGxp(terrain, net);
-  const saidiAfter = computeSaidi(net, emptyDevices()).overall;
-  const overlayOk = saidiBefore === saidiAfter &&
-    net.treeEdges.length === edgesBefore && net.feeders.length === feedersBefore;
-  console.assert(overlayOk, "subtransmission overlay changed the numbers");
+  const edgesBefore = net.treeEdges.length, roadEdgesBefore = graph.edges.length;
+  const subtx2 = buildSubtx(terrain, subs, loadCentroid, roadDistM);
+  const overlayOk = computeSaidi(net, emptyDevices()).overall === saidiBefore &&
+    net.treeEdges.length === edgesBefore && graph.edges.length === roadEdgesBefore &&
+    subtx2.lines.length === subtx.lines.length;
+  console.assert(overlayOk, "subtransmission changed the numbers");
   world.checks.push({
-    name: "Subtransmission overlay is visual-only",
+    name: "Subtransmission is visual-only",
     pass: overlayOk,
-    detail: `SAIDI ${saidiBefore.toFixed(2)} → ${saidiAfter.toFixed(2)} min/yr, ` +
-      `${edgesBefore} → ${net.treeEdges.length} sections, ${feedersBefore} → ${net.feeders.length} feeders`,
+    detail: `SAIDI ${saidiBefore.toFixed(2)} min/yr, ${edgesBefore} sections, ` +
+      `${roadEdgesBefore} road edges — all unchanged by (re)building ${subtx.lines.length} subtx lines`,
   });
+  world.validation = validateWorld(world);
   mark("checks", t);
   timings.total = Math.round(performance.now() - t0);
   world.timings = timings;
   return world;
 }
 
-// A plausible GXP (grid exit point): a flat mainland cell on the map edge
-// nearest the load-weighted centroid of the zone subs — where the national
-// grid would most cheaply enter this patch of country. Purely decorative.
-function pickGxp(terrain, net) {
-  const loads = net.subs.map(s =>
-    net.feeders.filter(f => f.sub === s.id).reduce((t, f) => t + f.customers, 0));
-  let wx = 0, wy = 0, W = 0;
-  net.subs.forEach((s, i) => { wx += s.x * loads[i]; wy += s.y * loads[i]; W += loads[i]; });
-  if (W <= 0) return null;
-  wx /= W; wy /= W;
-  const n = terrain.n;
-  let best = null, bestScore = Infinity;
-  for (let k = 0; k < n; k++) {
-    for (const [cx, cy] of [[k, 0], [k, n - 1], [0, k], [n - 1, k]]) {
-      const i = terrain.idx(cx, cy);
-      if (terrain.water[i] !== 0 || !terrain.mainland[i]) continue;
-      const [x, y] = terrain.cellCentre(cx, cy);
-      const score = Math.hypot(x - wx, y - wy) + terrain.slope[i] * 40000;
-      if (score < bestScore) { bestScore = score; best = { x, y }; }
+// ---- validation metrics + rules ------------------------------------------
+
+function validateWorld(world) {
+  const V = VALIDATION;
+  const failures = [];
+  // X: every sub near its own load centroid
+  const subCentroidKm = Math.max(0, ...world.net.subs.map(s =>
+    Math.hypot(s.x - s.centroidX, s.y - s.centroidY) / 1000));
+  if (subCentroidKm > V.MAX_SUB_CENTROID_KM) {
+    failures.push(`sub ${subCentroidKm.toFixed(1)} km from its load centroid (max ${V.MAX_SUB_CENTROID_KM})`);
+  }
+  // Y: no long-ruler subtransmission
+  const subtxStraightKm = world.subtx.maxStraightKm;
+  if (subtxStraightKm > V.MAX_SUBTX_STRAIGHT_KM) {
+    failures.push(`subtx straight for ${subtxStraightKm} km (max ${V.MAX_SUBTX_STRAIGHT_KM})`);
+  }
+  // grid orientations must not all agree (mod 90°, needs ≥3 towns)
+  let gridSpreadDeg = 90;
+  if (world.towns.length >= 3) {
+    gridSpreadDeg = 0;
+    for (let i = 0; i < world.towns.length; i++) {
+      for (let j = i + 1; j < world.towns.length; j++) {
+        const a = (world.towns[i].theta * 180 / Math.PI) % 90;
+        const b = (world.towns[j].theta * 180 / Math.PI) % 90;
+        const d = Math.abs(a - b);
+        gridSpreadDeg = Math.max(gridSpreadDeg, Math.min(d, 90 - d));
+      }
+    }
+    if (gridSpreadDeg < V.MIN_GRID_SPREAD_DEG) {
+      failures.push(`all town grids within ${gridSpreadDeg.toFixed(0)}° (min spread ${V.MIN_GRID_SPREAD_DEG}°)`);
     }
   }
+  // realised town sizes must be genuinely Zipf-ish, not near-uniform
+  const counts = world.towns.map(t => 0);
+  for (const c of world.customers) {
+    let bi = -1, bd = Infinity;
+    for (let i = 0; i < world.towns.length; i++) {
+      const t = world.towns[i];
+      const d = Math.hypot(c.x - t.x, c.y - t.y);
+      if (d < bd) { bd = d; bi = i; }
+    }
+    if (bi >= 0 && bd <= world.towns[bi].sigma * 3.2) counts[bi]++;
+  }
+  const sorted = counts.slice().sort((a, b) => b - a);
+  const median = sorted[Math.floor(sorted.length / 2)] || 1;
+  const zipfRatio = sorted[0] / Math.max(1, median);
+  const zipfTopRatio = sorted[0] / Math.max(1, sorted[1] ?? 1);
+  if (world.towns.length >= 3 && zipfRatio < V.MIN_ZIPF_RATIO) {
+    failures.push(`town sizes near-uniform: largest/median ${zipfRatio.toFixed(2)} (min ${V.MIN_ZIPF_RATIO})`);
+  }
+  return {
+    pass: failures.length === 0,
+    failures,
+    metrics: {
+      subCentroidKm: +subCentroidKm.toFixed(2),
+      subtxStraightKm,
+      gridSpreadDeg: +gridSpreadDeg.toFixed(1),
+      zipfRatio: +zipfRatio.toFixed(2),
+      zipfTopRatio: +zipfTopRatio.toFixed(2),
+      townCounts: sorted,
+    },
+  };
+}
+
+// Best-of-N wrapper: deterministic retry seeds; on exhaustion the attempt
+// with the FEWEST failures wins and the reasons are reported in Checks.
+export function generate(params) {
+  const attempts = [];
+  let best = null;
+  for (let a = 0; a < VALIDATION.MAX_ATTEMPTS; a++) {
+    const seed = a === 0 ? params.seed : `${params.seed}#retry${a}`;
+    const w = generateOnce({ ...params, seed });
+    attempts.push({ attempt: a + 1, seed, failures: w.validation.failures });
+    if (!best || w.validation.failures.length < best.validation.failures.length) best = w;
+    if (w.validation.failures.length === 0) break;
+  }
+  best.validationHistory = attempts;
+  const last = attempts[attempts.length - 1];
+  best.checks.push({
+    name: "Validation (regenerate-on-fail, best-of-N)",
+    pass: best.validation.pass,
+    detail: best.validation.pass
+      ? `passed on attempt ${attempts.length}/${VALIDATION.MAX_ATTEMPTS}` +
+        (attempts.length > 1 ? ` (earlier: ${attempts.slice(0, -1).map(x => x.failures.join("; ")).join(" | ")})` : "")
+      : `best of ${attempts.length} attempts — unresolved: ${best.validation.failures.join("; ")}`,
+  });
   return best;
 }
 
@@ -198,7 +291,11 @@ function selftest() {
       faultConservation: conservation.every(Boolean),
       roadVsLineMin: +Math.min(...rvl.map(r => r.ratio)).toFixed(3),
       roadVsLineMax: +Math.max(...rvl.map(r => r.ratio)).toFixed(3),
-      gxp: world.gxp ? [Math.round(world.gxp.x), Math.round(world.gxp.y)] : null,
+      gxp: world.subtx.gxp ? [Math.round(world.subtx.gxp.x), Math.round(world.subtx.gxp.y)] : null,
+      validationPass: world.validation.pass,
+      validationAttempts: world.validationHistory.length,
+      validationMetrics: world.validation.metrics,
+      unresolved: world.validation.failures,
       curveKnees: (() => {
         const mk = (kind) => {
           const res = greedyPlace(net, 20, kind);
@@ -214,8 +311,13 @@ function selftest() {
   // clean network, and must actually move the towns.
   const wCoast = generate({ seed: "aotearoa-1", nCust: 4000, nTowns: 5, inlandWeight: 0 });
   const wInland = generate({ seed: "aotearoa-1", nCust: 4000, nTowns: 5, inlandWeight: 1 });
+  // Correctness checks must pass; an unresolved best-of-N VALIDATION on
+  // this deliberately extreme world is a reported outcome, not a failure.
   const inlandTest = {
-    checksPass: wInland.checks.every(c => c.pass),
+    checksPass: wInland.checks
+      .filter(c => !c.name.startsWith("Validation")).every(c => c.pass),
+    validationUnresolved: wInland.validation.failures,
+    failedChecks: wInland.checks.filter(c => !c.pass).map(c => `${c.name}: ${c.detail}`),
     townsMoved: JSON.stringify(wCoast.towns.map(t => [t.x | 0, t.y | 0])) !==
       JSON.stringify(wInland.towns.map(t => [t.x | 0, t.y | 0])),
     meanCoastDistCoastal: townCoastDist(wCoast),
@@ -223,7 +325,7 @@ function selftest() {
   };
   const allPass = results.every(r =>
     r.checks.every(c => c.pass) && r.greedyMonotone && r.recloserMonotone &&
-    r.faultConservation &&
+    r.faultConservation && r.validationPass &&
     r.meanCustPerFeeder >= 200 && r.meanCustPerFeeder <= 800 &&
     r.gxp !== null && r.curveKnees.sw >= 1 && r.curveKnees.rc >= 1 &&
     r.totalMs < 5000 && (!r.debugSupported || r.debugRateWeighted === true)) &&
@@ -805,9 +907,18 @@ function initUI() {
   $("assumptions").innerHTML = ASSUMPTIONS.map(a =>
     `<div class="assumption"><strong>${a.area}</strong> — ${a.text}</div>`).join("");
 
-  // ?on=heat,density&off=roads — preset layers from the URL (handy for
-  // sharing a specific view and for headless screenshots)
+  // URL params: ?seed=x&cust=8000&towns=5&inland=100 preset the generation
+  // controls; ?on=heat,density&off=roads preset layers (handy for sharing
+  // a specific view and for headless screenshots)
   const qs = new URLSearchParams(location.search);
+  for (const [param, id] of [["seed", "seed"], ["cust", "nCust"], ["towns", "nTowns"], ["inland", "inland"]]) {
+    const v = qs.get(param);
+    if (v !== null) {
+      $(id).value = v;
+      const lbl = $(id + "Val");
+      if (lbl) lbl.textContent = v;
+    }
+  }
   for (const [param, val] of [["on", true], ["off", false]]) {
     for (const name of (qs.get(param) ?? "").split(",").filter(Boolean)) {
       if (name in state.renderer.layers) {

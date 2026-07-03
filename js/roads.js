@@ -14,7 +14,7 @@
 //  - Any disconnected road component is repaired by A* — the finished
 //    graph is asserted fully connected.
 
-import { CELL, GRID_N, MAP_SIZE } from "./terrain.js";
+import { CELL, GRID_N, MAP_SIZE, bfsDistanceM } from "./terrain.js";
 
 export const CLS_ARTERIAL = 0, CLS_COLLECTOR = 1, CLS_LOCAL = 2;
 
@@ -166,7 +166,7 @@ export class RoadGraph {
 
 // -------------------------------------------------------- terrain-grid A*
 
-class GridRouter {
+export class GridRouter {
   constructor(terrain) {
     this.t = terrain;
     const n = GRID_N * GRID_N;
@@ -284,13 +284,23 @@ function addRoutedCells(terrain, graph, cells, cls) {
   return { first: ids[0], last: ids[ids.length - 1] };
 }
 
-export function buildRoads(terrain, towns, customers, rng) {
+// STRICT LAYER ORDER: roads depend on terrain + settlements (+ their
+// provisional corridors) only — NOT on customers, which are sampled later
+// along the finished roads.
+export function buildRoads(terrain, towns, corridors, rng) {
   const graph = new RoadGraph();
   const router = new GridRouter(terrain);
   const n = GRID_N;
   const addRoutedPath = (cells, cls) => addRoutedCells(terrain, graph, cells, cls);
+  const arterialCellPaths = [];
 
-  // ---- 1. Arterials: MST over towns + one loop link
+  // ---- 1. Arterials: the provisional corridor skeleton becomes real
+  // (anchor↔anchor + map-edge exits), plus an MST over all towns and one
+  // loop link. Duplicate stretches collapse via graph edge dedupe.
+  for (const cells of corridors?.paths ?? []) {
+    addRoutedPath(cells, CLS_ARTERIAL);
+    arterialCellPaths.push(cells);
+  }
   const m = towns.length;
   if (m > 1) {
     const inTree = new Uint8Array(m);
@@ -309,7 +319,6 @@ export function buildRoads(terrain, towns, customers, rng) {
       inTree[bj] = 1;
       links.push([bi, bj]);
     }
-    // loop link: closest pair not already linked
     let extra = null, bd = Infinity;
     for (let i = 0; i < m; i++) {
       for (let j = i + 1; j < m; j++) {
@@ -321,27 +330,39 @@ export function buildRoads(terrain, towns, customers, rng) {
     if (extra) links.push(extra);
     for (const [i, j] of links) {
       const cells = router.route(towns[i].x, towns[i].y, towns[j].x, towns[j].y);
-      addRoutedPath(cells, CLS_ARTERIAL);
+      if (cells) {
+        addRoutedPath(cells, CLS_ARTERIAL);
+        arterialCellPaths.push(cells);
+      }
     }
   }
 
-  // ---- 2. Urban street grids
+  // ---- 2. Urban street grids: orientation snapped to the local coast /
+  // valley axis (never global north), density scaled by population, a
+  // regular core fraying to irregular edges.
   const rStreet = rng.fork("streets");
   for (const t of towns) {
-    const theta = rStreet.range(0, Math.PI / 2);
-    const s = rStreet.range(130, 165);
-    const ux = Math.cos(theta), uy = Math.sin(theta);
+    t.theta = townAxis(terrain, t);
+    const rT = rStreet.fork("t" + Math.round(t.x) + "_" + Math.round(t.y));
+    const s = 175 - 55 * Math.min(1, t.pop); // spacing: 120 m dominant → 170 m village
+    const ux = Math.cos(t.theta), uy = Math.sin(t.theta);
     const R = t.sigma * 2.3;
     const half = Math.ceil(R / s);
     const keep = new Map(); // "i,j" -> [x,y]
     for (let j = -half; j <= half; j++) {
       for (let i = -half; i <= half; i++) {
-        const x = t.x + (i * ux - j * uy) * s;
-        const y = t.y + (i * uy + j * ux) * s;
+        let x = t.x + (i * ux - j * uy) * s;
+        let y = t.y + (i * uy + j * ux) * s;
+        const rad = Math.hypot(x - t.x, y - t.y);
+        // fray: outer blocks drop out and wobble; the core stays regular
+        const fray = Math.max(0, (rad / R - 0.45) / 0.55);
+        if (rT.float() < 0.55 * fray * fray) continue;
+        x += (rT.float() - 0.5) * s * 0.7 * fray;
+        y += (rT.float() - 0.5) * s * 0.7 * fray;
         if (x < 0 || y < 0 || x > MAP_SIZE || y > MAP_SIZE) continue;
         if (!terrain.buildableAt(x, y)) continue;
-        const gauss = t.weight * Math.exp(-((x - t.x) ** 2 + (y - t.y) ** 2) / (2 * t.sigma * t.sigma));
-        if (gauss < 0.075 * t.weight) continue;
+        const gauss = Math.exp(-rad * rad / (2 * t.sigma * t.sigma));
+        if (gauss < 0.075) continue;
         keep.set(i + "," + j, [x, y]);
       }
     }
@@ -358,45 +379,95 @@ export function buildRoads(terrain, towns, customers, rng) {
     }
   }
 
-  // ---- 3. Rural roads to customer clusters
-  const BIN = 800;
-  const bins = new Map();
-  for (const c of customers) {
-    const k = ((c.x / BIN) | 0) * 4096 + ((c.y / BIN) | 0);
-    let b = bins.get(k);
-    if (!b) bins.set(k, b = { x: 0, y: 0, count: 0 });
-    b.x += c.x; b.y += c.y; b.count++;
+  // ---- 3. Rural roads: spurs branching off arterials into flat country
+  // (terrain-driven — rural LOAD follows these roads later, not vice
+  // versa). Spur seeds every ~2 km along arterials; some spurs fork.
+  const rSpur = rng.fork("spurs");
+  const spurTargets = [];
+  for (const cells of arterialCellPaths) {
+    let acc = 0;
+    for (let i = 1; i < cells.length; i++) {
+      acc += CELL;
+      if (acc < 1600 + rSpur.float() * 900) continue;
+      acc = 0;
+      if (rSpur.float() < 0.45) continue;
+      const [px, py] = terrain.cellCentre(cells[i] % n, (cells[i] / n) | 0);
+      const [qx, qy] = terrain.cellCentre(cells[i - 1] % n, (cells[i - 1] / n) | 0);
+      const dl = Math.hypot(px - qx, py - qy) || 1;
+      const side = rSpur.float() < 0.5 ? 1 : -1;
+      const len = rSpur.range(900, 3200);
+      const tx = px + (-(py - qy) / dl) * len * side + (rSpur.float() - 0.5) * 900;
+      const ty = py + ((px - qx) / dl) * len * side + (rSpur.float() - 0.5) * 900;
+      if (tx < 400 || ty < 400 || tx > MAP_SIZE - 400 || ty > MAP_SIZE - 400) continue;
+      if (!terrain.buildableAt(tx, ty) || terrain.slopeAt(tx, ty) > 0.3) continue;
+      const cellsSpur = router.route(px, py, tx, ty);
+      if (cellsSpur) {
+        addRoutedPath(cellsSpur, CLS_LOCAL);
+        spurTargets.push([tx, ty]);
+      }
+    }
   }
-  const clusters = [...bins.values()]
-    .map(b => ({ x: b.x / b.count, y: b.y / b.count, count: b.count }))
-    .sort((p, q) => q.count - p.count);
-  for (const cl of clusters) {
-    const near = graph.nearestNode(cl.x, cl.y, 30000);
-    if (near.id === -1) continue;
-    if (near.dist <= 350) continue;
-    const cells = router.route(graph.nx[near.id], graph.ny[near.id], cl.x, cl.y);
-    const ends = addRoutedPath(cells, CLS_LOCAL);
-    // stitch exact start node to first path node (same cell → cannot cross water)
-    if (ends) graph.addEdge(near.id, ends.first, CLS_LOCAL);
+  for (const [sx, sy] of spurTargets) {
+    if (rSpur.float() > 0.3) continue; // some spurs fork once more
+    const tx = sx + (rSpur.float() - 0.5) * 3600;
+    const ty = sy + (rSpur.float() - 0.5) * 3600;
+    if (tx < 400 || ty < 400 || tx > MAP_SIZE - 400 || ty > MAP_SIZE - 400) continue;
+    if (!terrain.buildableAt(tx, ty) || terrain.slopeAt(tx, ty) > 0.3) continue;
+    const cellsSpur = router.route(sx, sy, tx, ty);
+    if (cellsSpur) addRoutedPath(cellsSpur, CLS_LOCAL);
   }
 
   // ---- 4. Connectivity repair (assert-backed, not assumed)
   const repair = repairConnectivity(graph, terrain, router);
 
-  // ---- 5. Snap customers to nearest road node
-  let maxSnap = 0, sumSnap = 0;
-  for (const c of customers) {
-    const near = graph.nearestNode(c.x, c.y, 30000);
-    c.node = near.id;
-    maxSnap = Math.max(maxSnap, near.dist);
-    sumSnap += near.dist;
-  }
+  return { graph, repair };
+}
 
-  return {
-    graph,
-    repair,
-    snapStats: { max: maxSnap, mean: sumSnap / Math.max(1, customers.length) },
-  };
+// Local grid axis for a town: coastline tangent when the sea is close,
+// river direction when the river is close, else the terrain contour
+// direction. Normalised to [0, π/2) — grids are 4-fold symmetric.
+function townAxis(terrain, t) {
+  const norm = (a) => ((a % (Math.PI / 2)) + Math.PI / 2) % (Math.PI / 2);
+  // nearest ocean cell within ~4.5 km
+  const [tcx, tcy] = terrain.cellOf(t.x, t.y);
+  let oceanD = Infinity, oceanAng = 0;
+  const R = Math.ceil(4500 / CELL);
+  for (let dy = -R; dy <= R; dy++) {
+    for (let dx = -R; dx <= R; dx++) {
+      const ax = tcx + dx, ay = tcy + dy;
+      if (!terrain.inGrid(ax, ay)) continue;
+      if (!terrain.ocean[terrain.idx(ax, ay)]) continue;
+      const d = Math.hypot(dx, dy) * CELL;
+      if (d < oceanD) { oceanD = d; oceanAng = Math.atan2(dy, dx); }
+    }
+  }
+  // nearest river segment direction
+  const rp = terrain.riverPath;
+  let riverD = Infinity, riverAng = 0;
+  for (let i = 3; i < rp.length - 3; i += 3) {
+    const d = Math.hypot(rp[i].x - t.x, rp[i].y - t.y);
+    if (d < riverD) {
+      riverD = d;
+      riverAng = Math.atan2(rp[i + 3].y - rp[i - 3].y, rp[i + 3].x - rp[i - 3].x);
+    }
+  }
+  if (oceanD < 3500 && oceanD <= riverD) return norm(oceanAng + Math.PI / 2); // coast tangent
+  if (riverD < 3500) return norm(riverAng);
+  // contour direction: perpendicular to the elevation gradient
+  const h = 400;
+  const gx = terrain.elevAt(t.x + h, t.y) - terrain.elevAt(t.x - h, t.y);
+  const gy = terrain.elevAt(t.x, t.y + h) - terrain.elevAt(t.x, t.y - h);
+  return norm(Math.atan2(gy, gx) + Math.PI / 2);
+}
+
+// Distance-to-road field (metres per grid cell) — feeds roadside rural load.
+export function roadDistanceGrid(terrain, graph) {
+  const seeds = new Set();
+  for (const e of graph.edges) {
+    terrain.segmentHits(graph.nx[e.a], graph.ny[e.a], graph.nx[e.b], graph.ny[e.b],
+      (i) => { seeds.add(i); return false; });
+  }
+  return bfsDistanceM(terrain, [...seeds]);
 }
 
 export function components(graph) {

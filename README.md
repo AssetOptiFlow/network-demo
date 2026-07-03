@@ -37,40 +37,72 @@ the 6-sub cap (past ~30k each sub serves an unusually large area) and
 visual dot saturation in towns. The UI slider stops at 20,000; larger
 values work programmatically via `generate()` / `?scaletest=1`.
 
-## Pipeline (all seeded/deterministic, ~0.1–0.4 s at 8000 customers)
+## Pipeline — strict dependency order (seeded/deterministic, ~0.15–0.25 s/attempt at 8000 customers)
+
+Layers are produced in order, each consuming only earlier layers:
+**terrain → settlements → roads → load → substation catchments →
+subtransmission → feeders**, wrapped in a validation pass (below).
 
 1. **Terrain** ([js/terrain.js](js/terrain.js)) — fBm elevation + ramp puts
    the sea along one seed-chosen edge; one river is traced from the far map
    edge to the ocean (so it genuinely bisects the map); slope, lakes,
    buildability, main-landmass flood fill (banks joined via the river —
    roads may bridge rivers, never the ocean).
-2. **Density** ([js/density.js](js/density.js)) — towns seeded on flat,
-   coastal-biased sites **on both banks**; Gaussian falloff × fBm noise
-   (same noise family as the terrain).
-3. **Customers** ([js/customers.js](js/customers.js)) — 3000–8000 weighted
-   samples on buildable land only.
-4. **Roads** ([js/roads.js](js/roads.js)) — arterial MST between towns +
-   loop link, A* over the terrain grid (slope² cost, sea blocked, river
-   28× until a bridge exists, then reused); rotated urban street lattices;
-   rural A* spurs to customer clusters; connectivity repair. River
-   crossings register bridges; all segment-vs-water tests use exact
-   Amanatides–Woo grid traversal (no sampling gaps).
-5. **Electrical** ([js/network.js](js/network.js)) — capacitated TX
-   clustering (≤ 50 customers); zone subs by greedy facility location over
-   road distance (a new sub must capture ≥ 500 customers and either save
-   them ≥ 2 km each on average or relieve a sub serving > 4000 — so urban
-   subs max out near 4000 customers and rural subs can be as small as
-   ~500); multi-source Dijkstra over the road graph;
-   each sub tree is partitioned into feeders sized by local density —
-   ~250 customers rural up to ~700+ urban, ≈400–500 average — with runt
-   merging and junction-overshoot splitting. Feeder heads reach the sub by
-   an express run of parallel circuit along the same roads; heads more
-   than 4 km out merge into the feeder owning their trunk (up to the
-   1000-customer cap), so long expresses only survive where a corridor is
-   genuinely full. Sections in
-   high-density cells are underground cable (drawn dashed), the rest
+2. **Settlements** ([js/density.js](js/density.js)) — sites scored on
+   flatness, a coastal↔river blend (Inland slider), river-mouth proximity,
+   and junctions of a provisional least-cost corridor skeleton (anchors ↔
+   map-edge exits) that later seeds the arterials. Populations follow a
+   Zipf rank-size law (α = 1.25: one dominant, 2–3 medium, several small),
+   σ ∝ √pop, spacing scaled to town size, both river banks settled.
+3. **Roads** ([js/roads.js](js/roads.js)) — arterials = corridor skeleton +
+   MST + loop link, A* with slope² cost (sea blocked; first river crossing
+   builds a bridge at 28×, then reused). Urban grids: spacing scales with
+   population, orientation snaps to the local coast/valley axis — never
+   global north — regular core fraying to irregular edges. Rural roads:
+   spurs off arterials into flat country (some fork). Exact grid traversal
+   for all water tests; connectivity repair.
+4. **Load** ([js/customers.js](js/customers.js)) — density = mass-
+   compensated town Gaussians (a sea-clipped town gets denser, keeping
+   realised sizes Zipf) + rural background decaying with ROAD distance, so
+   sparse rural load hugs the roads; 3000–20000 customers sampled on
+   buildable land, snapped to the road graph.
+5. **Substation catchments** ([js/network.js](js/network.js)) —
+   deterministic k-means over the customer points (catchments > 4000
+   split in two, < 500 merge into their nearest neighbour); each zone sub
+   sits at its catchment's **load-weighted centroid**, nudged to the
+   nearest subtransmission-viable road node (arterial/collector corridor,
+   gentle slope) — never a geometric centre, never a town marker.
+6. **Subtransmission** ([js/subtx.js](js/subtx.js)) — GXP on a flat
+   map-edge cell near the load centroid; least-cost A* lines GXP → each
+   sub (slope penalised, ocean blocked, river crossings 6×, road corridors
+   rewarded, micro-siting cost noise); adjacent subs **share trunk
+   corridors before branching**, plus one inter-sub tie routed to avoid
+   the trunks. VISUAL ONLY — a check asserts SAIDI and network structure
+   are unchanged by (re)building it.
+7. **Feeders** ([js/network.js](js/network.js)) — capacitated TX
+   clustering (≤ 50 customers), multi-source Dijkstra over roads from the
+   subs, each sub tree partitioned into feeders sized by local density
+   (~250 rural – ~700+ urban, ≈400–500 average) with runt merging,
+   junction-overshoot splitting and express-run accounting (heads > 4 km
+   out merge into their trunk feeder up to a 1000-customer cap). Sections
+   in high-density cells are underground cable (drawn dashed), the rest
    overhead.
-6. **Reliability** ([js/reliability.js](js/reliability.js)) — per-feeder
+
+### Validation pass ([js/main.js](js/main.js), `VALIDATION`)
+
+Named, tunable rules; a failing world regenerates on a deterministic retry
+seed (`seed#retry1`, …); after `MAX_ATTEMPTS = 4` the **best attempt wins
+(fewest failures) and the unresolved reasons are reported** in the Checks
+panel — never a hard fail.
+
+```
+MAX_SUB_CENTROID_KM   = 5    // X: sub too far from its load centroid
+MAX_SUBTX_STRAIGHT_KM = 6    // Y: subtx line straight for too long
+MIN_GRID_SPREAD_DEG   = 15   // all town grids sharing one orientation
+MIN_ZIPF_RATIO        = 3.0  // realised largest/median town size too flat
+```
+
+8. **Reliability** ([js/reliability.js](js/reliability.js)) — per-feeder
    SAIDI with separate overhead/underground fault rates (defaults 0.10 /
    0.03 faults·km⁻¹·yr⁻¹, both adjustable live in the UI); outage = crew
    travel from the sub at 50 km/h along roads + flat 120 min repair (both
