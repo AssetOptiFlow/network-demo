@@ -27,7 +27,10 @@ export const VALIDATION = {
   MAX_SUBTX_STRAIGHT_KM: 8,  // Y: subtx line straight for longer than this
                              //    (membership flow yields denser sub fans)
   MIN_GRID_SPREAD_DEG: 15,   // all town grids within this spread = suspicious
-  MIN_ZIPF_RATIO: 3.0,       // realised largest/median town size below this = too uniform
+  MIN_ZIPF_RATIO: 2.2,       // realised largest/median town size below this = too
+                             // uniform (the gradual peri-urban density kernel
+                             // spreads big-town mass outward, so realised ratios
+                             // sit lower than the pure-Gaussian era's 3.0)
   MAX_ATTEMPTS: 4,
 };
 
@@ -228,7 +231,7 @@ export function countsForTargets(net, kind, rateMul = null) {
 function selftest() {
   const results = [];
   for (const seed of ["aotearoa-1", "kahikatea-2", "rimu-3"]) {
-    const world = generate({ seed, nCust: 8000, nTowns: 5 });
+    const world = generate({ seed, nCust: 25000, nTowns: 5 }); // the fixed UI size
     const { net } = world;
     const greedy = greedyPlace(net, 12, "switch");
     const mono = checkMonotone(greedy.log);
@@ -346,8 +349,8 @@ function selftest() {
   }
   // Inland-weighting slider path: full-inland towns must still generate a
   // clean network, and must actually move the towns.
-  const wCoast = generate({ seed: "aotearoa-1", nCust: 4000, nTowns: 5, inlandWeight: 0 });
-  const wInland = generate({ seed: "aotearoa-1", nCust: 4000, nTowns: 5, inlandWeight: 1 });
+  const wCoast = generate({ seed: "aotearoa-1", nCust: 25000, nTowns: 5, inlandWeight: 0 });
+  const wInland = generate({ seed: "aotearoa-1", nCust: 25000, nTowns: 5, inlandWeight: 1 });
   // Correctness checks must pass; an unresolved best-of-N VALIDATION on
   // this deliberately extreme world is a reported outcome, not a failure.
   const inlandTest = {
@@ -366,10 +369,12 @@ function selftest() {
   const allPass = results.every(r =>
     r.checks.every(c => c.pass || c.tunable) && r.greedyMonotone && r.recloserMonotone &&
     r.faultConservation && r.validationPass &&
-    // degeneracy band, recalibrated for membership caps (rural ≤ 300 and
-    // corridor splits pull the mean to ~90)
-    r.meanCustPerFeeder >= 60 && r.meanCustPerFeeder <= 800 &&
-    r.gxp !== null &&
+    // degeneracy bands: target ≈ 80–120 feeders at the fixed 25k world
+    // (fill-to-cap growth + runt folding); the gates are set wider so a
+    // seed slightly outside the ideal band reports rather than fails
+    r.feeders >= 80 && r.feeders <= 150 &&
+    r.meanCustPerFeeder >= 120 && r.meanCustPerFeeder <= 800 &&
+    r.gxp !== null && r.subs === 18 && // sub count is FIXED
     r.drTargets.sw.counts[0] !== null && r.drTargets.rc.counts[0] !== null &&
     r.totalMs < 5000 && (!r.debugSupported || r.debugRateWeighted === true)) &&
     inlandTest.checksPass && inlandTest.townsMoved;
@@ -454,10 +459,14 @@ const state = {
 
 function fmt(x, dp = 1) { return x.toLocaleString("en-NZ", { maximumFractionDigits: dp, minimumFractionDigits: dp }); }
 
+// The UI world is FIXED at 25 000 customers (18 zone subs are fixed in
+// membership.js); other sizes remain available programmatically.
+const N_CUST_FIXED = 25000;
+
 function regenerate() {
   const params = {
     seed: $("seed").value || "aotearoa",
-    nCust: +$("nCust").value,
+    nCust: N_CUST_FIXED,
     nTowns: +$("nTowns").value,
     inlandWeight: +$("inland").value / 100,
   };
@@ -482,7 +491,6 @@ function regenerate() {
   renderChecks();
   computeDrTable();
   refreshDerived();
-  renderRoadVsLine();
   renderFeederStats(-1);
   $("greedyLog").innerHTML = "";
   $("playbackInfo").innerHTML = "<em>Toggle fault mode, then click a line section on the map.</em>";
@@ -583,16 +591,28 @@ function refreshDerived() {
   renderLeague();
   updateHeat();
   renderDrTable();
+  renderSubTable();
   renderFeederStats(state.renderer.selectedFeeder);
 }
 
-function renderRoadVsLine() {
-  const rows = state.world.roadVsLine.map(r =>
-    `<tr><td><span class="chip" style="background:${feederColour(r.feeder)}"></span> F${r.feeder}</td>` +
-    `<td>${fmt(r.roadKm, 2)}</td><td>${fmt(r.lineKm, 2)}</td><td><strong>${fmt(r.ratio, 2)}×</strong></td></tr>`
-  ).join("");
-  $("rvlTable").innerHTML =
-    `<tr><th>Feeder</th><th>Road km</th><th>Line km</th><th>Ratio</th></tr>` + rows;
+// Zone sub summary — customers, total HV feeder length, customer-weighted
+// SAIDI under the current devices/rates. Worst first.
+function renderSubTable() {
+  const { net } = state.world;
+  const per = computeSaidi(net, currentDevices(), state.rateMul).perFeeder;
+  const cmOf = new Map(per.map(p => [p.feeder, p.custMin]));
+  const rows = net.subs.map(s => {
+    const fs = net.feeders.filter(f => f.sub === s.id);
+    const cust = fs.reduce((t, f) => t + f.customers, 0);
+    const lenKm = fs.reduce((t, f) => t + f.lengthM, 0) / 1000;
+    const cm = fs.reduce((t, f) => t + (cmOf.get(f.id) ?? 0), 0);
+    return { s, nF: fs.length, cust, lenKm, saidi: cust > 0 ? cm / cust : 0 };
+  }).sort((a, b) => b.saidi - a.saidi);
+  $("subTable").innerHTML =
+    `<tr><th>Zone sub</th><th>Feeders</th><th>Cust</th><th>HV km</th><th>SAIDI</th></tr>` +
+    rows.map(r =>
+      `<tr><td>${r.s.name}</td><td>${r.nF}</td><td>${Math.round(r.cust).toLocaleString("en-NZ")}</td>` +
+      `<td>${fmt(r.lenKm, 0)}</td><td><strong>${fmt(r.saidi)}</strong></td></tr>`).join("");
 }
 
 function renderFeederStats(fid) {
@@ -834,7 +854,7 @@ function initUI() {
     $("seed").value = "nz-" + Math.floor(performance.now() * 997 % 100000);
     regenerate();
   });
-  for (const id of ["nCust", "nTowns", "inland"]) {
+  for (const id of ["nTowns", "inland"]) {
     $(id).addEventListener("input", () => { $(id + "Val").textContent = $(id).value; });
   }
   for (const layer of ["terrain", "density", "roads", "customers", "network", "txs", "switches", "bridges", "roadVsLine", "heat", "subtx"]) {
@@ -856,7 +876,6 @@ function initUI() {
       state.world.roadVsLine = roadVsLine(state.world.net, state.world.graph);
       computeDrTable();
       refreshDerived();
-      renderRoadVsLine();
       renderChecks();
       draw();
     });
@@ -887,7 +906,7 @@ function initUI() {
   // controls; ?on=heat,density&off=roads preset layers (handy for sharing
   // a specific view and for headless screenshots)
   const qs = new URLSearchParams(location.search);
-  for (const [param, id] of [["seed", "seed"], ["cust", "nCust"], ["towns", "nTowns"], ["inland", "inland"]]) {
+  for (const [param, id] of [["seed", "seed"], ["towns", "nTowns"], ["inland", "inland"]]) {
     const v = qs.get(param);
     if (v !== null) {
       $(id).value = v;

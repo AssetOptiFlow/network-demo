@@ -35,7 +35,7 @@ export const SWITCH_MIN = 45;
 // underground cable (cables fault far less often; the flat 120 min repair
 // is kept for both, which flatters cable repairs — labelled in UI).
 // Adjustable at runtime via the UI.
-export const faultRates = { oh: 0.10, ug: 0.03 }; // faults / km / yr
+export const faultRates = { oh: 0.08, ug: 0.02 }; // faults / km / yr
 
 export function setFaultRates(oh, ug) {
   if (isFinite(oh) && oh >= 0) faultRates.oh = oh;

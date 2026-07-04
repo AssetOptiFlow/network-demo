@@ -26,10 +26,13 @@ export const N_URBAN_MAX = 700;        // customer cap, urban feeder
 export const N_RURAL_MAX = 300;        // customer cap, rural feeder
 export const RURAL_EXTENT_KM_MAX = 10; // rural growth radius by road
 export const FEEDER_MIN_CUST = 150;    // runts below this merge if caps allow
+export const N_SUBS = 18;              // FIXED zone-sub count (grouping is forced to it)
 export const FEEDERS_PER_SUB_MAX = 8;  // feeder-count cap per zone sub
+export const URBAN_EXTENT_KM_MAX = 6;  // urban growth radius by road (compactness guard)
 export const GROUP_SPREAD_KM_MAX = 16; // max bbox diagonal of one sub's feeder group
 
 export const capOf = (urban) => (urban ? N_URBAN_MAX : N_RURAL_MAX);
+const TX_HALF = 25; // headroom below which a feeder counts as full (half a TX)
 
 // ------------------------------------------------------------ primitives
 
@@ -161,12 +164,17 @@ export function clusterFeeders(graph, loadNodes, allowed = null, idBase = 0) {
       if (seen.has(v)) continue;
       seen.add(v);
       const d = dist[v];
-      if (!urban && d > RURAL_EXTENT_KM_MAX * 1000) break;
+      if (d > (urban ? URBAN_EXTENT_KM_MAX : RURAL_EXTENT_KM_MAX) * 1000) break;
       const li = loadAt.get(v);
       if (li !== undefined && inScope(li) && feederOf[li] === -1) {
-        if (cust + loadNodes[li].cust > cap && li !== si) break grow;
-        feederOf[li] = fid;
-        cust += loadNodes[li].cust;
+        // a node that would overflow is SKIPPED (it seeds a later feeder),
+        // and growth continues filling with smaller nodes — feeders end
+        // near their cap instead of ~40% full
+        if (cust + loadNodes[li].cust <= cap || li === si) {
+          feederOf[li] = fid;
+          cust += loadNodes[li].cust;
+          if (cust >= cap - TX_HALF) break grow; // effectively full
+        }
       }
       for (const ei of graph.adj[v]) {
         const e = graph.edges[ei];
@@ -349,5 +357,76 @@ export function groupFeeders(graph, loadNodes, feederOf, nFeeders) {
     if (!groupIds.has(r)) groupIds.set(r, groupIds.size);
     groupOf[f] = groupIds.get(r);
   }
-  return { groupOf, nGroups: groupIds.size, subLabelOfNode: label };
+  // FORCE exactly N_SUBS groups: extra groups merge into their most
+  // compact neighbour (spread cap waived — the sub count is fixed);
+  // too few groups split by Morton order of feeder centroids.
+  forceGroupCount(graph, loadNodes, feederOf, groupOf, Math.min(N_SUBS, nFeeders));
+  let nGroups = 0;
+  for (const g of groupOf) nGroups = Math.max(nGroups, g + 1);
+  return { groupOf, nGroups, subLabelOfNode: label };
+}
+
+// Feeder centroid (load-weighted) helper for group forcing/splitting.
+function feederCentroids(graph, loadNodes, feederOf, nFeeders) {
+  const cx = new Float64Array(nFeeders), cy = new Float64Array(nFeeders), cw = new Float64Array(nFeeders);
+  for (let i = 0; i < loadNodes.length; i++) {
+    const f = feederOf[i];
+    if (f === -1) continue;
+    cx[f] += graph.nx[loadNodes[i].node] * loadNodes[i].cust;
+    cy[f] += graph.ny[loadNodes[i].node] * loadNodes[i].cust;
+    cw[f] += loadNodes[i].cust;
+  }
+  for (let f = 0; f < nFeeders; f++) {
+    if (cw[f] > 0) { cx[f] /= cw[f]; cy[f] /= cw[f]; }
+  }
+  return { cx, cy };
+}
+
+// Mutate groupOf in place until exactly `target` groups exist (compact,
+// deterministic). Exported so the repair loop can re-enforce the fixed
+// sub count after membership mutations.
+export function forceGroupCount(graph, loadNodes, feederOf, groupOf, target) {
+  const nFeeders = groupOf.length;
+  if (!nFeeders || target < 1) return;
+  const { cx, cy } = feederCentroids(graph, loadNodes, feederOf, nFeeders);
+  const centreOf = (members) => {
+    let sx = 0, sy = 0;
+    for (const f of members) { sx += cx[f]; sy += cy[f]; }
+    return [sx / members.length, sy / members.length];
+  };
+  for (let guard = 0; guard < 4 * nFeeders; guard++) {
+    const groups = new Map(); // group id -> [feeder ids]
+    for (let f = 0; f < nFeeders; f++) {
+      if (!groups.has(groupOf[f])) groups.set(groupOf[f], []);
+      groups.get(groupOf[f]).push(f);
+    }
+    const ids = [...groups.keys()].sort((a, b) => a - b);
+    if (ids.length === target) break;
+    if (ids.length > target) {
+      // merge the two groups whose centres are nearest
+      let bi = -1, bj = -1, bd = Infinity;
+      for (let i = 0; i < ids.length; i++) {
+        const [xi, yi] = centreOf(groups.get(ids[i]));
+        for (let j = i + 1; j < ids.length; j++) {
+          const [xj, yj] = centreOf(groups.get(ids[j]));
+          const d = Math.hypot(xi - xj, yi - yj);
+          if (d < bd) { bd = d; bi = ids[i]; bj = ids[j]; }
+        }
+      }
+      for (const f of groups.get(bj)) groupOf[f] = bi;
+    } else {
+      // split the group with the most feeders by Morton order of centroids
+      const big = ids.map(id => groups.get(id)).sort((a, b) => b.length - a.length || groupOf[a[0]] - groupOf[b[0]])[0];
+      if (big.length < 2) break; // cannot split further
+      const sorted = big.slice().sort((a, b) => morton(cx[a], cy[a]) - morton(cx[b], cy[b]) || a - b);
+      const newId = Math.max(...ids) + 1;
+      for (const f of sorted.slice(Math.ceil(sorted.length / 2))) groupOf[f] = newId;
+    }
+  }
+  // compact ids 0..target-1
+  const remap = new Map();
+  for (let f = 0; f < nFeeders; f++) {
+    if (!remap.has(groupOf[f])) remap.set(groupOf[f], remap.size);
+    groupOf[f] = remap.get(groupOf[f]);
+  }
 }

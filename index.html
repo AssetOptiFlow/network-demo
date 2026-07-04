@@ -35,8 +35,8 @@
         <button id="randomSeed" title="Random seed">🎲</button>
       </div>
       <div class="row">
-        <label for="nCust">Customers <span id="nCustVal">6000</span></label>
-        <input id="nCust" type="range" min="3000" max="20000" step="100" value="6000">
+        <label>Customers</label>
+        <span class="detail">25,000 (fixed) · 18 zone subs (fixed)</span>
       </div>
       <div class="row">
         <label for="nTowns">Towns <span id="nTownsVal">5</span></label>
@@ -79,9 +79,9 @@
       </div>
       <div class="row">
         <label for="rateOh">λ overhead</label>
-        <input id="rateOh" type="number" step="0.01" min="0" max="2" value="0.10" style="width:5em">
+        <input id="rateOh" type="number" step="0.01" min="0" max="2" value="0.08" style="width:5em">
         <label for="rateUg">λ underground</label>
-        <input id="rateUg" type="number" step="0.01" min="0" max="2" value="0.03" style="width:5em">
+        <input id="rateUg" type="number" step="0.01" min="0" max="2" value="0.02" style="width:5em">
       </div>
       <div class="detail">faults / km / yr per line type. Underground = sections in
         high-density cells (drawn dashed). Repair stays a flat 120 min for both —
@@ -102,12 +102,12 @@
       <h2>Greedy devices</h2>
       <div class="row">
         <label for="nSwitches">Sectionalisers</label>
-        <input id="nSwitches" type="number" min="1" max="60" value="8" style="width:4em">
+        <input id="nSwitches" type="number" min="1" max="60" value="1" style="width:4em">
         <button id="placeSwitches" class="primary">Place</button>
       </div>
       <div class="row">
         <label for="nReclosers">Reclosers</label>
-        <input id="nReclosers" type="number" min="1" max="30" value="4" style="width:4em">
+        <input id="nReclosers" type="number" min="1" max="30" value="1" style="width:4em">
         <button id="placeReclosers" class="primary">Place</button>
         <button id="resetSwitches">Reset all</button>
       </div>
@@ -142,9 +142,12 @@
     </section>
 
     <section>
-      <h2>Road vs straight line <span class="unit">(sub → fault, rate-weighted)</span></h2>
-      <table id="rvlTable"></table>
-      <div class="detail">Ratio &gt; 1 because crews follow roads — bridges and terrain detours push it up, differently per feeder.</div>
+      <h2>Zone subs <span class="unit">(worst first, live)</span></h2>
+      <div class="leaguewrap"><table id="subTable"></table></div>
+      <div class="detail">Per zone sub: feeders, customers, total HV feeder
+        length and customer-weighted SAIDI under the current devices and
+        fault rates. The “road vs line” map layer still draws crew route vs
+        straight line for a selected section.</div>
     </section>
 
     <section>

@@ -18,10 +18,11 @@ python -m http.server 8317
 ```
 
 Optional URL modes:
-- `?selftest=1` — headless self-test: generates three seeds at 8000
-  customers, runs every correctness check, greedy placement of both device
-  kinds (monotonicity asserted), the debug rate experiment, and
-  fault-conservation checks, and prints a JSON report into the page.
+- `?selftest=1` — headless self-test: generates three seeds at the fixed
+  25 000 customers, runs every correctness check (18-sub count asserted),
+  greedy placement of both device kinds (monotonicity asserted), the
+  debug rate experiment, and fault-conservation checks, and prints a JSON
+  report into the page.
 - `?demo=1` — regenerates, places 8 sectionalisers + 4 reclosers, and
   freezes a fault mid-timeline (handy for screenshots).
 - `?scaletest=1` — one seed at 8k→64k customers with timing + checks.
@@ -34,8 +35,9 @@ at 64k, ≈ 0.3 s at 8k; the membership route/validate/repair loop
 dominates). Feeder counts scale with load (≈ customers/100 under the
 default caps). Past ~32k the `MAX_SUBS = 24` backstop clamps sub count,
 so the tunable feeders-per-sub rule reports honest residuals at scale.
-The UI slider stops at 20,000; larger values work programmatically via
-`generate()` / `?scaletest=1`.
+The UI is fixed at 25,000 customers; other sizes work programmatically
+via `generate()` / `?scaletest=1` (the 18-sub count stays fixed, so very
+large worlds report feeders-per-sub residuals).
 
 ## Pipeline — strict dependency order (seeded/deterministic)
 
@@ -63,19 +65,26 @@ subs, before any routing) → sub siting → feeder routing → subtransmission
    spurs off arterials into flat country (some fork). Exact grid traversal
    for all water tests; connectivity repair.
 4. **Load** ([js/customers.js](js/customers.js)) — density = mass-
-   compensated town Gaussians (a sea-clipped town gets denser, keeping
-   realised sizes Zipf) + rural background decaying with ROAD distance, so
-   sparse rural load hugs the roads; 3000–20000 customers sampled on
-   buildable land, snapped to the road graph.
+   compensated town kernels (Gaussian core + exponential shoulder, so
+   density eases through a peri-urban fringe rather than cliff-edging at
+   the town boundary; a sea-clipped town gets denser, keeping realised
+   sizes rank-ordered) + rural background decaying with ROAD distance, so
+   sparse rural load hugs the roads; **25 000 customers (fixed in the
+   UI)** sampled on buildable land, snapped to the road graph.
 5. **Membership** ([js/membership.js](js/membership.js)) — decided BEFORE
    any routing. Customers classified urban/rural by local density
    (`URBAN_CUST_PER_KM2 = 60` within 500 m — absolute, so a denser world
    classifies more urban). Customers (as TX load nodes, ≤ 50 cust/TX) →
    feeders by **road-graph-capacitated clustering** (urban ≤ `N_URBAN_MAX
    = 700`; rural ≤ `N_RURAL_MAX = 300` plus a `RURAL_EXTENT_KM_MAX = 10`
-   road-radius cap; runts < 150 merge). Feeders → zone subs by grouping
+   road-radius cap; growth fills to the cap by skipping oversize nodes,
+   and runts < 150 fold into their road-nearest neighbour — targeting
+   **~80–120 feeders** at the fixed 25 000 customers). Feeders →
+   **exactly `N_SUBS = 18` zone subs (fixed)** by grouping
    **road-adjacent** feeders (shared road-graph Voronoi boundary, not
-   straight-line proximity), ≤ `FEEDERS_PER_SUB_MAX = 8` per sub.
+   straight-line proximity); grouping is forced to the count and every
+   repair is count-preserving, with `FEEDERS_PER_SUB_MAX = 8` as the
+   tunable per-sub ceiling.
 6. **Sub siting** ([js/network.js](js/network.js)) — each zone sub sits at
    the **load-weighted centroid of its feeder group**, nudged to the
    nearest subtransmission-viable road node (arterial/collector corridor,
@@ -113,17 +122,20 @@ panel — never a hard fail.
 MAX_SUB_CENTROID_KM   = 5    // X: sub too far from its feeder-group load centroid
 MAX_SUBTX_STRAIGHT_KM = 8    // Y: subtx line straight for too long
 MIN_GRID_SPREAD_DEG   = 15   // all town grids sharing one orientation
-MIN_ZIPF_RATIO        = 3.0  // realised largest/median town size too flat
+MIN_ZIPF_RATIO        = 2.2  // realised largest/median town size too flat
+                             // (the peri-urban kernel spreads big-town mass)
 ```
 
 ### Membership caps ([js/membership.js](js/membership.js), [js/network.js](js/network.js) — all tunable)
 
 ```
-URBAN_CUST_PER_KM2      = 60    // urban ⇔ ≥ this within 500 m (absolute — scales with slider)
+N_SUBS                  = 18    // zone-sub count — FIXED (grouping forced to it)
+URBAN_CUST_PER_KM2      = 60    // urban ⇔ ≥ this many customers within 500 m
 N_URBAN_MAX             = 700   // customer cap, urban feeder
 N_RURAL_MAX             = 300   // customer cap, rural feeder
 RURAL_EXTENT_KM_MAX     = 10    // rural feeder growth radius by road (span ≤ 2×)
 FEEDERS_PER_SUB_MAX     = 8     // feeder-count cap per zone sub
+URBAN_EXTENT_KM_MAX     = 6     // urban feeder growth radius (compactness guard)
 GROUP_SPREAD_KM_MAX     = 16    // max bbox diagonal of one sub's feeder group
 MAX_FEEDER_KM           = 20    // trunk: sub → farthest member by road
 MAX_FOREIGN_CROSSING_M  = 2500  // transit on another sub's actual network
@@ -136,8 +148,8 @@ tune, and does not gate the selftest — correctness checks (conservation,
 contiguity, membership honoured, monotonicity, fault conservation) do.
 
 9. **Reliability** ([js/reliability.js](js/reliability.js)) — per-feeder
-   SAIDI with separate overhead/underground fault rates (defaults 0.10 /
-   0.03 faults·km⁻¹·yr⁻¹, both adjustable live in the UI); outage = crew
+   SAIDI with separate overhead/underground fault rates (defaults 0.08 /
+   0.02 faults·km⁻¹·yr⁻¹, both adjustable live in the UI); outage = crew
    travel from the sub at 50 km/h along roads + flat 120 min repair (both
    line types — flatters cables, labelled); switching restores upstream
    customers at a flat 45 min (flat time ⇒ greedy placement is provably
@@ -164,9 +176,10 @@ contiguity, membership honoured, monotonicity, fault conservation) do.
   with the faulted / out-until-repair / isolatable / restored classes in
   distinct status colours. Customer conservation (out + isolatable =
   affected) is asserted per fault.
-- **Road vs straight line** — per-feeder rate-weighted ratio of crew road
-  distance to straight-line distance (bridges/terrain push it above 1);
-  with the layer on and a section selected the two routes are drawn.
+- **Zone sub summary** — per-sub table (worst first, live): feeder count,
+  customers, total HV feeder length, customer-weighted SAIDI under the
+  current devices and fault rates. The "road vs line" map layer still
+  draws crew road route vs straight line for a selected section.
 - **Devices-for-improvement table** — the fewest sectionalisers and the
   fewest reclosers (each kind placed greedily from a device-free network)
   needed to cut network SAIDI by ≥ 10%, 25% and 50%. Greedy stops as soon
@@ -186,8 +199,8 @@ contiguity, membership honoured, monotonicity, fault conservation) do.
   (flat map-edge cell near the load centroid) to each zone sub. VISUAL
   ONLY: a correctness check asserts SAIDI and network structure are
   identical with and without it.
-- Seed input, customer/town/inland sliders, eleven layer toggles,
-  click-a-feeder stats, pan/zoom.
+- Seed input, town/inland sliders (customers fixed at 25 000, zone subs
+  fixed at 18), eleven layer toggles, click-a-feeder stats, pan/zoom.
 
 ## Correctness guards (asserted and reported in the Checks panel)
 

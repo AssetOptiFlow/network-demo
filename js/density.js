@@ -173,6 +173,19 @@ function buildCorridorSkeleton(terrain, anchors) {
   };
 }
 
+// Town density kernel: Gaussian core + exponential shoulder, so density
+// eases from town grid through a peri-urban fringe into rural — no cliff
+// at the town edge. Shared by the mass-compensation integral and the
+// field build so compensation stays exact.
+const KERNEL_SHOULDER = 0.28;   // share of peak carried by the fringe
+const KERNEL_TAIL_SIGMA = 1.7;  // shoulder e-folding length, in σ
+function townKernel(r2, sigma) {
+  const core = Math.exp(-r2 / (2 * sigma * sigma));
+  const tail = Math.exp(-Math.sqrt(r2) / (KERNEL_TAIL_SIGMA * sigma));
+  return (1 - KERNEL_SHOULDER) * core + KERNEL_SHOULDER * tail;
+}
+const KERNEL_R_SIGMA = 6; // integration / evaluation radius (σ) for the tail
+
 // Density field — built AFTER roads so rural load can hug them.
 export function buildDensityGrid(terrain, towns, roadDistM, rng) {
   const n = GRID_N;
@@ -180,20 +193,20 @@ export function buildDensityGrid(terrain, towns, roadDistM, rng) {
   const grid = new Float32Array(n * n);
   let maxD = 0;
 
-  // Mass compensation: a town Gaussian clipped by sea/steep land loses
-  // customers, flattening the Zipf distribution. Integrate each Gaussian
+  // Mass compensation: a town kernel clipped by sea/steep land loses
+  // customers, flattening the Zipf distribution. Integrate each kernel
   // over BUILDABLE cells and set its weight so realised mass ∝ population
   // (a hemmed-in town gets denser, not smaller — very Wellington).
   const rawW = towns.map(t => {
     let I = 0;
-    const R = Math.ceil(3.5 * t.sigma / CELL);
+    const R = Math.ceil(KERNEL_R_SIGMA * t.sigma / CELL);
     const [tcx, tcy] = terrain.cellOf(t.x, t.y);
     for (let cy = Math.max(0, tcy - R); cy <= Math.min(n - 1, tcy + R); cy++) {
       for (let cx = Math.max(0, tcx - R); cx <= Math.min(n - 1, tcx + R); cx++) {
         const i = cy * n + cx;
         if (!terrain.buildableCell(i)) continue;
         const [x, y] = terrain.cellCentre(cx, cy);
-        I += Math.exp(-((x - t.x) ** 2 + (y - t.y) ** 2) / (2 * t.sigma * t.sigma));
+        I += townKernel((x - t.x) ** 2 + (y - t.y) ** 2, t.sigma);
       }
     }
     return t.pop / Math.max(1e-6, I);
@@ -211,7 +224,7 @@ export function buildDensityGrid(terrain, towns, roadDistM, rng) {
       let d = 0.022 * Math.exp(-(isFinite(rd) ? rd : 1e9) / 800);
       for (const t of towns) {
         const r2 = (x - t.x) ** 2 + (y - t.y) ** 2;
-        d += t.weight * Math.exp(-r2 / (2 * t.sigma * t.sigma));
+        if (r2 < (KERNEL_R_SIGMA * t.sigma) ** 2) d += t.weight * townKernel(r2, t.sigma);
       }
       d *= 0.55 + 0.9 * fbm01(cx / n * 4.2, cy / n * 4.2, seed, 4);
       grid[i] = d;

@@ -28,8 +28,8 @@
 
 import {
   classifyCustomers, buildLoadNodes, clusterFeeders, mergeRuntFeeders,
-  feederVoronoi, groupFeeders, NodeHeap, morton, capOf,
-  FEEDERS_PER_SUB_MAX, RURAL_EXTENT_KM_MAX, FEEDER_MIN_CUST,
+  feederVoronoi, groupFeeders, forceGroupCount, NodeHeap, morton, capOf,
+  N_SUBS, FEEDERS_PER_SUB_MAX, RURAL_EXTENT_KM_MAX, FEEDER_MIN_CUST,
 } from "./membership.js";
 
 export const TX_CAP = 50;
@@ -46,10 +46,8 @@ export const MAX_FOREIGN_CROSSING_M = 2500; // transit through a foreign sub's c
 export const MAX_REPAIR_PASSES = 3;
 export const CAP_SLACK = 1.10;            // headroom before a cap counts as violated
                                           // (trunk-load absorbs jitter counts upward)
-const MAX_SUBS = 24;                      // backstop for repair-created subs
-// A remote valley pocket this big justifies its own small rural sub when
-// no existing sub is closer — real utilities build them for exactly this.
-const NEW_SUB_MIN_CUST = 150;
+// The zone-sub count is FIXED at N_SUBS (membership.js): grouping is
+// forced to it and every repair is count-preserving.
 
 // =====================================================================
 // buildNetwork — membership first, routing last.
@@ -77,7 +75,17 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   const repairLog = [];
   let built = null;
   for (let pass = 0; ; pass++) {
-    const mem = materialise(loadNodes, M);
+    let mem = materialise(loadNodes, M);
+    // sub count is FIXED: re-enforce after any repair that drifted it
+    const wantSubs = Math.min(N_SUBS, mem.feeders.length);
+    if (mem.nGroups !== wantSubs) {
+      const groupOf = new Int32Array(mem.feeders.length);
+      for (const f of mem.feeders) groupOf[f.id] = f.group;
+      forceGroupCount(graph, loadNodes, mem.feederOf, groupOf, wantSubs);
+      for (const f of mem.feeders) M.fidGroup.set(f.oldFid, groupOf[f.id]);
+      mem = materialise(loadNodes, M);
+      repairLog.push({ pass, action: "sub count re-enforced", detail: `${mem.nGroups} groups` });
+    }
     const subs = placeSubsForGroups(terrain, graph, towns, loadNodes, mem);
     built = routeMembership(terrain, graph, density, loadNodes, mem, subs, M, repairLog, pass);
     const viol = validateMembership(graph, loadNodes, built);
@@ -362,11 +370,9 @@ function routeMembership(terrain, graph, density, loadNodes, mem, subs, M, repai
       return out;
     };
 
-    // settle ownership; early rounds may absorb runt components upstream —
-    // but never past the receiving feeder's cap (absorb jitter otherwise
-    // re-inflates trunk feeders every pass)
-    for (let round = 0; round < 6; round++) {
-      deriveOwnership();
+    // customer totals per raw feeder id, refreshed on demand — absorbs are
+    // cap-bounded so a corridor trunk cannot swallow fragments without limit
+    const custOfAll = () => {
       const custOf = new Map(), urbOf = new Map();
       for (let i = 0; i < loadNodes.length; i++) {
         const f = M.feederOf[i];
@@ -374,14 +380,19 @@ function routeMembership(terrain, graph, density, loadNodes, mem, subs, M, repai
         custOf.set(f, (custOf.get(f) ?? 0) + loadNodes[i].cust);
         urbOf.set(f, (urbOf.get(f) ?? 0) + loadNodes[i].urbanCust);
       }
-      const capOfFid = (f) => capOf((urbOf.get(f) ?? 0) * 2 >= (custOf.get(f) ?? 0));
+      return { custOf, capOfFid: (f) => capOf((urbOf.get(f) ?? 0) * 2 >= (custOf.get(f) ?? 0)) };
+    };
+    // settle ownership; rounds may absorb runt components upstream within cap
+    for (let round = 0; round < 6; round++) {
+      deriveOwnership();
+      const { custOf, capOfFid } = custOfAll();
       let changed = false;
       for (const comps of componentsOf()) {
         for (const comp of comps.slice(1)) {
           const pr = parent[comp.root];
           const upstream = sameSub(pr) ? ownerOld[pr] : -1;
           if (comp.cust < FEEDER_MIN_CUST && upstream >= 0 &&
-              (custOf.get(upstream) ?? 0) + comp.cust <= capOfFid(upstream)) {
+              (custOf.get(upstream) ?? 0) + comp.cust <= capOfFid(upstream) * CAP_SLACK) {
             for (const v of comp.nodes) {
               const li = loadAt.get(v);
               if (li !== undefined && M.feederOf[li] === comp.f) M.feederOf[li] = upstream;
@@ -394,20 +405,37 @@ function routeMembership(terrain, graph, density, loadNodes, mem, subs, M, repai
       }
       if (!changed) break;
     }
-    // component-materialise sweep: contiguity GUARANTEED by construction —
-    // extra components become new feeders with nodes reassigned directly,
-    // and ownership is NOT re-derived afterwards.
+    // Component-materialise sweep: contiguity GUARANTEED by construction —
+    // ownership is NOT re-derived; components are RECOMPUTED after every
+    // mutation round (a stale snapshot can strand absorbed nodes when a
+    // later split relabels the receiving component). Small components
+    // absorb upstream within a generous cap; the rest become new feeders.
     deriveOwnership();
-    for (const comps of componentsOf()) {
-      for (const comp of comps.slice(1)) {
-        const newFid = M.nextFid++;
-        M.fidGroup.set(newFid, M.fidGroup.get(comp.f));
-        for (const v of comp.nodes) {
-          ownerOld[v] = newFid;
-          const li = loadAt.get(v);
-          if (li !== undefined && M.feederOf[li] === comp.f) M.feederOf[li] = newFid;
+    // one feeder per iteration, components recomputed in between — the
+    // bound comfortably exceeds any observed multi-component feeder count
+    for (let sweep = 0; sweep < 600; sweep++) {
+      const all = componentsOf();
+      if (!all.length) break;
+      const { custOf, capOfFid } = custOfAll();
+      for (const comps of all) {
+        for (const comp of comps.slice(1)) {
+          const pr = parent[comp.root];
+          const upstream = sameSub(pr) ? ownerOld[pr] : -1;
+          const absorb = comp.cust < FEEDER_MIN_CUST && upstream >= 0 &&
+            (custOf.get(upstream) ?? 0) + comp.cust <= capOfFid(upstream) * 1.25;
+          const targetFid = absorb ? upstream : M.nextFid++;
+          if (!absorb) M.fidGroup.set(targetFid, M.fidGroup.get(comp.f));
+          for (const v of comp.nodes) {
+            ownerOld[v] = targetFid;
+            const li = loadAt.get(v);
+            if (li !== undefined && M.feederOf[li] === comp.f) M.feederOf[li] = targetFid;
+          }
+          if (absorb) {
+            custOf.set(upstream, (custOf.get(upstream) ?? 0) + comp.cust);
+            trunkAbsorbs++;
+          } else forcedSplits++;
         }
-        forcedSplits++;
+        break; // recompute components before touching the next feeder
       }
     }
   }
@@ -433,7 +461,7 @@ function routeMembership(terrain, graph, density, loadNodes, mem, subs, M, repai
 }
 
 // Move one load node's membership to the road-nearest feeder of a given
-// sub (or of any OTHER sub when subId is -1).
+// sub; subId -1 = any OTHER sub, subId -2 = any feeder at all (≠ own).
 function moveToNearestFeeder(graph, loadNodes, mem, M, li, subId) {
   const heap = new NodeHeap();
   const dist = new Map([[loadNodes[li].node, 0]]);
@@ -447,9 +475,10 @@ function moveToNearestFeeder(graph, loadNodes, mem, M, li, subId) {
     const lj = loadAt.get(v);
     if (lj !== undefined && lj !== li && mem.feederOf[lj] !== -1 &&
         mem.feederOf[lj] !== mem.feederOf[li] &&
-        (subId === -1
-          ? mem.feeders[mem.feederOf[lj]].group !== mem.feeders[mem.feederOf[li]]?.group
-          : mem.feeders[mem.feederOf[lj]].group === subId)) {
+        (subId === -2 ? true
+          : subId === -1
+            ? mem.feeders[mem.feederOf[lj]].group !== mem.feeders[mem.feederOf[li]]?.group
+            : mem.feeders[mem.feederOf[lj]].group === subId)) {
       M.feederOf[li] = mem.feeders[mem.feederOf[lj]].oldFid;
       return true;
     }
@@ -472,12 +501,11 @@ function validateMembership(graph, loadNodes, built) {
   const viol = [];
   for (const f of mem.feeders) {
     const cap = capOf(f.urban);
-    // tiny fragments only — genuine small leaf feeders are realistic and
-    // kept; TINY_FEEDER guards against split debris
-    const TINY_FEEDER = 50;
-    if (f.cust < TINY_FEEDER && mem.feeders.filter(x => x.group === f.group).length > 1) {
+    // runt feeders fold into neighbours — split debris and stranded
+    // fragments below FEEDER_MIN_CUST are not plausible circuits
+    if (f.cust < FEEDER_MIN_CUST && mem.feeders.filter(x => x.group === f.group).length > 1) {
       viol.push({ kind: "runt", feeder: f.id, lis: f.loadIdx.slice(),
-        detail: `F${f.id} only ${f.cust} cust (< ${TINY_FEEDER})` });
+        detail: `F${f.id} only ${f.cust} cust (< ${FEEDER_MIN_CUST})` });
     }
     if (f.cust > cap * CAP_SLACK) {
       viol.push({ kind: "cap", feeder: f.id,
@@ -541,12 +569,13 @@ function applyRepairs(graph, loadNodes, M, built, viol, repairLog, pass) {
   const applied = [];
   for (const v of viol) {
     if (v.kind === "runt") {
-      // fold a runt feeder into its road-nearest same-sub neighbour
+      // fold a runt feeder into the road-NEAREST feeder of any sub — for
+      // a cross-corridor fragment that is the foreign feeder surrounding
+      // it, which also removes the crossing (and the fragment) next pass
       const f = mem.feeders[v.feeder];
       let moved = 0;
       for (const li of v.lis) {
-        if (moveToNearestFeeder(graph, loadNodes, mem, M, li, f.group) ||
-            moveToNearestFeeder(graph, loadNodes, mem, M, li, -1)) moved++;
+        if (moveToNearestFeeder(graph, loadNodes, mem, M, li, -2)) moved++;
       }
       applied.push(`runt: F${v.feeder} (${f.cust} cust) folded into neighbours (${moved} node(s))`);
     } else if (v.kind === "cap" || v.kind === "extent") {
@@ -572,7 +601,8 @@ function applyRepairs(graph, loadNodes, M, built, viol, repairLog, pass) {
       }
       sx /= c; sy /= c;
       // nearest OTHER sub, headroom preferred; the pocket only moves when
-      // that sub is genuinely closer to it than its own sub
+      // that sub is genuinely closer to it than its own sub (the sub
+      // count is fixed, so a pocket can never spawn a new sub)
       const dOwn = Math.hypot(subs[f.group].x - sx, subs[f.group].y - sy);
       let bestG = -1, bd = Infinity;
       for (const s of subs) {
@@ -581,14 +611,7 @@ function applyRepairs(graph, loadNodes, M, built, viol, repairLog, pass) {
         const d = Math.hypot(s.x - sx, s.y - sy) + (n < FEEDERS_PER_SUB_MAX ? 0 : 3000);
         if (d < bd) { bd = d; bestG = s.id; }
       }
-      const newFid = M.nextFid++;
-      const groupCount = new Set([...M.fidGroup.values()]).size;
-      const donorFid = bestG !== -1 && bd < dOwn
-        ? mem.feeders.find(x => x.group === bestG).oldFid // reuse that group's key
-        : null;
-      // a brand-new sub only for a pocket big enough to justify one
-      const spawnSub = donorFid === null && c >= NEW_SUB_MIN_CUST && groupCount < MAX_SUBS;
-      if (donorFid === null && !spawnSub) {
+      if (bestG === -1 || bd >= dOwn) {
         // last resort: each far member re-homes to the road-nearest
         // feeder of any other sub
         let moved = 0;
@@ -596,12 +619,11 @@ function applyRepairs(graph, loadNodes, M, built, viol, repairLog, pass) {
         applied.push(`trunk: F${v.feeder} far pocket (${c} cust) — ${moved} member(s) re-homed by road`);
         continue;
       }
-      M.fidGroup.set(newFid,
-        donorFid !== null ? M.fidGroup.get(donorFid)
-          : Math.max(...M.fidGroup.values()) + 1);
+      const newFid = M.nextFid++;
+      const donorFid = mem.feeders.find(x => x.group === bestG).oldFid;
+      M.fidGroup.set(newFid, M.fidGroup.get(donorFid));
       for (const li of far) M.feederOf[li] = newFid;
-      applied.push(`trunk: F${v.feeder} far pocket (${c} cust) → ` +
-        (donorFid !== null ? `sub group ${bestG}` : "new sub"));
+      applied.push(`trunk: F${v.feeder} far pocket (${c} cust) → sub group ${bestG}`);
     } else if (v.kind === "foreign") {
       // whole feeder moves to the sub it keeps transiting, if it has room
       // (unconditional moves churn the grouping and never settle); else
@@ -625,16 +647,34 @@ function applyRepairs(graph, loadNodes, M, built, viol, repairLog, pass) {
         applied.push(`foreign: F${v.feeder} — ${moved} member(s) beyond the transit re-homed to sub ${v.foreignSub}`);
       }
     } else if (v.kind === "group") {
-      // split the oversize group in two by Morton order of feeder seeds
+      // count-preserving: the group's smallest feeders re-home to the
+      // nearest other sub with room (the sub count is fixed — no splits)
       const members = mem.feeders.filter(f => f.group === v.sub)
-        .sort((a, b) => {
-          const na = loadNodes[a.loadIdx[0]].node, nb = loadNodes[b.loadIdx[0]].node;
-          return morton(graph.nx[na], graph.ny[na]) - morton(graph.nx[nb], graph.ny[nb]);
-        });
-      const half = Math.ceil(members.length / 2);
-      const newGroup = Math.max(...M.fidGroup.values()) + 1;
-      for (const f of members.slice(half)) M.fidGroup.set(f.oldFid, newGroup);
-      applied.push(`group: sub ${v.sub} split (${members.length} → ${half}+${members.length - half} feeders)`);
+        .sort((a, b) => a.cust - b.cust || a.id - b.id);
+      const excess = members.slice(0, Math.max(0, members.length - FEEDERS_PER_SUB_MAX));
+      let moved = 0;
+      for (const f of excess) {
+        let sx = 0, sy = 0, w = 0;
+        for (const li of f.loadIdx) {
+          sx += graph.nx[loadNodes[li].node] * loadNodes[li].cust;
+          sy += graph.ny[loadNodes[li].node] * loadNodes[li].cust;
+          w += loadNodes[li].cust;
+        }
+        sx /= Math.max(1, w); sy /= Math.max(1, w);
+        let best = -1, bd = Infinity;
+        for (const s of subs) {
+          if (s.id === v.sub) continue;
+          const n = mem.feeders.filter(x => x.group === s.id).length;
+          if (n >= FEEDERS_PER_SUB_MAX) continue;
+          const d = Math.hypot(s.x - sx, s.y - sy);
+          if (d < bd) { bd = d; best = s.id; }
+        }
+        if (best === -1) break; // every other sub is full — residual
+        const donor = mem.feeders.find(x => x.group === best);
+        M.fidGroup.set(f.oldFid, M.fidGroup.get(donor.oldFid));
+        moved++;
+      }
+      applied.push(`group: sub ${v.sub} — ${moved}/${excess.length} feeder(s) re-homed to neighbouring subs`);
     }
   }
   repairLog.push({ pass, action: "repairs", detail: applied.join("; ") || "none applicable" });
