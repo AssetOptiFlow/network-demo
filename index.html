@@ -89,12 +89,13 @@
     </section>
 
     <section>
-      <h2>Diminishing returns <span class="unit">(greedy from zero, live)</span></h2>
-      <div id="drChart"></div>
-      <div id="drTip" class="detail" style="min-height:1.2em"></div>
-      <div class="detail">Network SAIDI vs device count, each kind placed greedily
-        from a device-free network. ◯ marks the knee (max distance from the
-        chord); ● marks your currently placed mix.</div>
+      <h2>Devices for SAIDI improvement <span class="unit">(greedy from zero, live)</span></h2>
+      <table id="drTable"></table>
+      <div id="drNow" class="detail" style="min-height:1.2em"></div>
+      <div class="detail">Fewest devices of each kind — placed greedily from a
+        device-free network — to cut network SAIDI by each target.
+        “&gt;N” = target not reached within the placement cap;
+        “not reachable” = greedy ran out of beneficial sites first.</div>
     </section>
 
     <section>

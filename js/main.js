@@ -191,6 +191,35 @@ export function generate(params) {
   return best;
 }
 
+// ---------------------------------- devices-for-improvement table
+
+const DR_TARGETS = [0.10, 0.25, 0.50];
+const DR_CAP = { switch: 60, recloser: 30 }; // match the UI input limits
+
+// Fewest greedily-placed devices of one kind (from a device-free network)
+// to reach each fractional SAIDI improvement. Placed in batches so the
+// search stops as soon as the deepest target is met; a null count means
+// the target was not reached (exhausted tells the two reasons apart).
+export function countsForTargets(net, kind, rateMul = null) {
+  const cap = DR_CAP[kind];
+  const counts = DR_TARGETS.map(() => null);
+  let devices = null, placed = 0, base = null, exhausted = false;
+  while (placed < cap && !exhausted && counts[counts.length - 1] === null) {
+    const res = greedyPlace(net, Math.min(6, cap - placed), kind, devices, rateMul);
+    if (base === null) base = res.baseline;
+    for (const l of res.log) {
+      if (l.stopped) { exhausted = true; break; }
+      placed++;
+      const imp = (base - l.saidiAfter) / base;
+      for (let i = 0; i < DR_TARGETS.length; i++) {
+        if (counts[i] === null && imp >= DR_TARGETS[i]) counts[i] = placed;
+      }
+    }
+    devices = res.devices;
+  }
+  return { counts, exhausted, cap };
+}
+
 // ------------------------------------------------------------- selftest
 
 function selftest() {
@@ -296,15 +325,10 @@ function selftest() {
       validationAttempts: world.validationHistory.length,
       validationMetrics: world.validation.metrics,
       unresolved: world.validation.failures,
-      curveKnees: (() => {
-        const mk = (kind) => {
-          const res = greedyPlace(net, 20, kind);
-          const pts = [res.baseline];
-          for (const l of res.log) if (!l.stopped) pts.push(l.saidiAfter);
-          return kneeIndex(pts);
-        };
-        return { sw: mk("switch"), rc: mk("recloser") };
-      })(),
+      drTargets: {
+        sw: countsForTargets(net, "switch"),
+        rc: countsForTargets(net, "recloser"),
+      },
     });
   }
   // Inland-weighting slider path: full-inland towns must still generate a
@@ -327,7 +351,8 @@ function selftest() {
     r.checks.every(c => c.pass) && r.greedyMonotone && r.recloserMonotone &&
     r.faultConservation && r.validationPass &&
     r.meanCustPerFeeder >= 200 && r.meanCustPerFeeder <= 800 &&
-    r.gxp !== null && r.curveKnees.sw >= 1 && r.curveKnees.rc >= 1 &&
+    r.gxp !== null &&
+    r.drTargets.sw.counts[0] !== null && r.drTargets.rc.counts[0] !== null &&
     r.totalMs < 5000 && (!r.debugSupported || r.debugRateWeighted === true)) &&
     inlandTest.checksPass && inlandTest.townsMoved;
   const out = { allPass, inlandTest, results };
@@ -436,7 +461,7 @@ function regenerate() {
     `${ohKm.toFixed(0)} km OH / ${ugKm.toFixed(0)} km UG, ` +
     `${world.terrain.bridges.length} bridge(s)`;
   renderChecks();
-  computeCurves();
+  computeDrTable();
   refreshDerived();
   renderRoadVsLine();
   renderFeederStats(-1);
@@ -477,103 +502,35 @@ function renderSaidi() {
   $("saidiDelta").textContent = fmt(delta);
 }
 
-// ------------------------------------------- diminishing-returns chart
+// ------------------------------- devices-for-improvement table (UI)
 
-const CURVE_N = 20;
-
-// Knee = point of maximum distance from the chord between the curve's
-// endpoints, in normalised coordinates (a standard elbow heuristic).
-function kneeIndex(pts) {
-  if (pts.length < 3) return -1;
-  const n = pts.length - 1;
-  const y0 = pts[0], y1 = pts[n];
-  if (y0 - y1 < 1e-9) return -1;
-  let best = -1, bestD = -1;
-  for (let k = 1; k < n; k++) {
-    const tx = k / n, ty = (pts[k] - y1) / (y0 - y1);
-    const d = Math.abs(tx + ty - 1) / Math.SQRT2;
-    if (d > bestD) { bestD = d; best = k; }
-  }
-  return best;
-}
-
-function computeCurves() {
+function computeDrTable() {
   const { net } = state.world;
-  const mk = (kind) => {
-    const res = greedyPlace(net, CURVE_N, kind, null, state.rateMul);
-    const pts = [res.baseline];
-    for (const l of res.log) if (!l.stopped) pts.push(l.saidiAfter);
-    return pts;
+  state.drTable = {
+    sw: countsForTargets(net, "switch", state.rateMul),
+    rc: countsForTargets(net, "recloser", state.rateMul),
   };
-  const sw = mk("switch"), rc = mk("recloser");
-  state.curves = { sw, rc, kneeSw: kneeIndex(sw), kneeRc: kneeIndex(rc) };
 }
 
-const CURVE_COL = { sw: "#2a78d6", rc: "#1baf7a" };
-
-function renderCurve() {
-  const c = state.curves;
-  if (!c) return;
-  const W = 340, H = 190, ml = 46, mr = 66, mt = 10, mb = 26;
-  const iw = W - ml - mr, ih = H - mt - mb;
-  const maxY = Math.max(c.sw[0], c.rc[0]) * 1.04;
-  const X = (k) => ml + (k / CURVE_N) * iw;
-  const Y = (v) => mt + ih - (v / maxY) * ih;
-  const path = (pts) => pts.map((v, k) => `${k ? "L" : "M"}${X(k).toFixed(1)},${Y(v).toFixed(1)}`).join("");
-  let grid = "";
-  for (let g = 0; g <= 4; g++) {
-    const v = maxY * g / 4, y = Y(v);
-    grid += `<line x1="${ml}" x2="${W - mr}" y1="${y}" y2="${y}" stroke="#e1e0d9" stroke-width="1"/>` +
-      `<text x="${ml - 5}" y="${y + 3.5}" text-anchor="end" fill="#898781" font-size="10">${Math.round(v)}</text>`;
-  }
-  const knee = (pts, k, col) => k < 1 ? "" :
-    `<circle cx="${X(k)}" cy="${Y(pts[k])}" r="4.5" fill="#fcfcfb" stroke="${col}" stroke-width="2"/>` +
-    `<text x="${X(k)}" y="${Y(pts[k]) - 8}" text-anchor="middle" fill="#52514e" font-size="10">knee ${k}</text>`;
-  const endLabel = (pts, col, name, dy) =>
-    `<text x="${X(pts.length - 1) + 5}" y="${Y(pts[pts.length - 1]) + dy}" fill="${col}" font-size="10.5" font-weight="600">${name}</text>`;
-  // "you are here": the actual placed mix (may combine both device kinds)
+function renderDrTable() {
+  const t = state.drTable;
+  if (!t) return;
+  const cell = (r, i) => r.counts[i] !== null ? `<strong>${r.counts[i]}</strong>`
+    : r.exhausted ? `<span class="detail">not reachable</span>`
+    : `<span class="detail">&gt;${r.cap}</span>`;
+  $("drTable").innerHTML =
+    `<tr><th>SAIDI cut</th><th>Sectionalisers</th><th>Reclosers</th></tr>` +
+    DR_TARGETS.map((tgt, i) =>
+      `<tr><td>≥ ${Math.round(tgt * 100)}%</td><td>${cell(t.sw, i)}</td><td>${cell(t.rc, i)}</td></tr>`
+    ).join("");
+  // the actual placed mix (may combine both device kinds), for comparison
   const dev = currentDevices();
-  const placed = dev.switches.size + dev.reclosers.size;
-  let here = "";
-  if (placed > 0 && placed <= CURVE_N) {
-    const nowSaidi = computeSaidi(state.world.net, dev, state.rateMul).overall;
-    here = `<circle cx="${X(placed)}" cy="${Y(nowSaidi)}" r="4" fill="#0b0b0b"/>` +
-      `<text x="${X(placed) + 6}" y="${Y(nowSaidi) + 3}" fill="#0b0b0b" font-size="10">placed</text>`;
-  }
-  const swLast = c.sw[c.sw.length - 1], rcLast = c.rc[c.rc.length - 1];
-  const labelSpread = Math.abs(Y(swLast) - Y(rcLast)) < 12 ? 12 : 0;
-  $("drChart").innerHTML =
-    `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="SAIDI vs device count">
-      ${grid}
-      <line x1="${ml}" x2="${W - mr}" y1="${Y(0)}" y2="${Y(0)}" stroke="#c3c2b7" stroke-width="1"/>
-      <text x="${(ml + W - mr) / 2}" y="${H - 6}" text-anchor="middle" fill="#898781" font-size="10">devices placed (greedy, from zero)</text>
-      <text x="12" y="${mt + 8}" fill="#898781" font-size="10">min/yr</text>
-      <path d="${path(c.sw)}" fill="none" stroke="${CURVE_COL.sw}" stroke-width="2"/>
-      <path d="${path(c.rc)}" fill="none" stroke="${CURVE_COL.rc}" stroke-width="2"/>
-      ${knee(c.sw, c.kneeSw, CURVE_COL.sw)}
-      ${knee(c.rc, c.kneeRc, CURVE_COL.rc)}
-      ${endLabel(c.sw, CURVE_COL.sw, "switches", Y(swLast) <= Y(rcLast) ? -labelSpread + 3 : labelSpread + 3)}
-      ${endLabel(c.rc, CURVE_COL.rc, "reclosers", Y(rcLast) < Y(swLast) ? -labelSpread + 3 : labelSpread + 3)}
-      ${here}
-      <line id="drCross" x1="0" x2="0" y1="${mt}" y2="${mt + ih}" stroke="#898781" stroke-width="1" opacity="0"/>
-      <rect id="drHover" x="${ml}" y="${mt}" width="${iw}" height="${ih}" fill="transparent"/>
-    </svg>`;
-  const svg = $("drChart").querySelector("svg");
-  const hover = svg.querySelector("#drHover");
-  const cross = svg.querySelector("#drCross");
-  const tip = $("drTip");
-  hover.addEventListener("mousemove", (e) => {
-    const box = svg.getBoundingClientRect();
-    const px = (e.clientX - box.left) / box.width * W;
-    const k = Math.max(0, Math.min(CURVE_N, Math.round((px - ml) / iw * CURVE_N)));
-    cross.setAttribute("x1", X(k)); cross.setAttribute("x2", X(k));
-    cross.setAttribute("opacity", "1");
-    tip.textContent = `${k} device${k === 1 ? "" : "s"}: switches ${fmt(c.sw[Math.min(k, c.sw.length - 1)])} · reclosers ${fmt(c.rc[Math.min(k, c.rc.length - 1)])} min/yr`;
-  });
-  hover.addEventListener("mouseleave", () => {
-    cross.setAttribute("opacity", "0");
-    tip.textContent = "";
-  });
+  if (dev.switches.size + dev.reclosers.size === 0) { $("drNow").textContent = ""; return; }
+  const base = computeSaidi(state.world.net, emptyDevices(), state.rateMul).overall;
+  const now = computeSaidi(state.world.net, dev, state.rateMul).overall;
+  $("drNow").textContent =
+    `Placed mix (${dev.switches.size} SW + ${dev.reclosers.size} RC): ` +
+    `${fmt(100 * (base - now) / base)}% improvement`;
 }
 
 // ------------------------------------------------ feeder league + heat
@@ -606,7 +563,7 @@ function refreshDerived() {
   renderSaidi();
   renderLeague();
   updateHeat();
-  renderCurve();
+  renderDrTable();
   renderFeederStats(state.renderer.selectedFeeder);
 }
 
@@ -737,7 +694,7 @@ function toggleDebugRate(on) {
             : `<strong class="bad">boosted benefit did NOT double ✗</strong>`);
     }
   }
-  computeCurves();
+  computeDrTable();
   refreshDerived();
   draw();
 }
@@ -878,7 +835,7 @@ function initUI() {
       setFaultRates(+$("rateOh").value, +$("rateUg").value);
       // placed devices stay; all figures recompute under the new rates
       state.world.roadVsLine = roadVsLine(state.world.net, state.world.graph);
-      computeCurves();
+      computeDrTable();
       refreshDerived();
       renderRoadVsLine();
       renderChecks();
@@ -939,7 +896,7 @@ function initUI() {
     for (const l of rSw.log.filter(l => !l.stopped)) state.renderer.switchList.push(l.teId);
     const rRc = greedyPlace(net, 4, "recloser", currentDevices());
     for (const l of rRc.log.filter(l => !l.stopped)) state.renderer.recloserList.push(l.teId);
-    renderSaidi();
+    refreshDerived();
     const mid = net.treeEdges[Math.floor(net.treeEdges.length * 0.55)];
     startFault(mid.id);
     state.playbackAnim.playing = false;

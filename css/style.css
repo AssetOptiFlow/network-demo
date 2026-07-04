@@ -122,7 +122,6 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; }
 
 .legendline { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
 
-#drChart svg { display: block; }
 .leaguewrap { max-height: 200px; overflow-y: auto; }
 #leagueTable tr[data-fid] { cursor: pointer; }
 #leagueTable tr[data-fid]:hover { background: var(--page); }

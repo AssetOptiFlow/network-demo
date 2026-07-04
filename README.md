@@ -134,11 +134,14 @@ MIN_ZIPF_RATIO        = 3.0  // realised largest/median town size too flat
 - **Road vs straight line** — per-feeder rate-weighted ratio of crew road
   distance to straight-line distance (bridges/terrain push it above 1);
   with the layer on and a section selected the two routes are drawn.
-- **Diminishing-returns chart** — network SAIDI vs device count (0–20),
-  switches and reclosers as separate series each placed greedily from a
-  device-free network, knee marked per series (max-distance-from-chord),
-  plus a "placed" marker for your current mix. Live-updates with fault
-  rates and debug mode; hover for exact values.
+- **Devices-for-improvement table** — the fewest sectionalisers and the
+  fewest reclosers (each kind placed greedily from a device-free network)
+  needed to cut network SAIDI by ≥ 10%, 25% and 50%. Greedy stops as soon
+  as the deepest target is met; ">N" means the target wasn't reached
+  within the placement cap (60 SW / 30 RC, matching the UI inputs) and
+  "not reachable" means greedy ran out of beneficial sites first. Your
+  currently placed mix's improvement is shown below the table.
+  Live-updates with fault rates and debug mode.
 - **Feeder league table** — feeders ranked worst-first by customer-minutes
   per year (SAIDI × customers); click a row to zoom the map to that feeder.
   The matching "SAIDI heat" layer shades customer cells by the serving
