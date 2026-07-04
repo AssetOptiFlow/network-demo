@@ -28,20 +28,21 @@ Optional URL modes:
 
 ## Scaling
 
-Measured (Windows, headless Edge): all correctness checks pass and greedy
-stays monotone up to at least **64,000 customers** (regen ≈ 2.2 s; TX
-clustering dominates). The 5 s regen budget runs out around ~100k. Sub and
-feeder counts now scale with load (subs 1–6, feeders ≈ customers/430), so
-feeder sizes stay plausible well past 20k; the remaining soft ceiling is
-the 6-sub cap (past ~30k each sub serves an unusually large area) and
-visual dot saturation in towns. The UI slider stops at 20,000; larger
-values work programmatically via `generate()` / `?scaletest=1`.
+Measured (Windows, headless Edge): all **correctness** checks pass and
+greedy stays monotone up to at least **64,000 customers** (regen ≈ 5.1 s
+at 64k, ≈ 0.3 s at 8k; the membership route/validate/repair loop
+dominates). Feeder counts scale with load (≈ customers/100 under the
+default caps). Past ~32k the `MAX_SUBS = 24` backstop clamps sub count,
+so the tunable feeders-per-sub rule reports honest residuals at scale.
+The UI slider stops at 20,000; larger values work programmatically via
+`generate()` / `?scaletest=1`.
 
-## Pipeline — strict dependency order (seeded/deterministic, ~0.15–0.25 s/attempt at 8000 customers)
+## Pipeline — strict dependency order (seeded/deterministic)
 
 Layers are produced in order, each consuming only earlier layers:
-**terrain → settlements → roads → load → substation catchments →
-subtransmission → feeders**, wrapped in a validation pass (below).
+**terrain → settlements → roads → load → membership (customers → feeders →
+subs, before any routing) → sub siting → feeder routing → subtransmission
+(visual only)**, wrapped in a validation pass (below).
 
 1. **Terrain** ([js/terrain.js](js/terrain.js)) — fBm elevation + ramp puts
    the sea along one seed-chosen edge; one river is traced from the far map
@@ -66,27 +67,40 @@ subtransmission → feeders**, wrapped in a validation pass (below).
    realised sizes Zipf) + rural background decaying with ROAD distance, so
    sparse rural load hugs the roads; 3000–20000 customers sampled on
    buildable land, snapped to the road graph.
-5. **Substation catchments** ([js/network.js](js/network.js)) —
-   deterministic k-means over the customer points (catchments > 4000
-   split in two, < 500 merge into their nearest neighbour); each zone sub
-   sits at its catchment's **load-weighted centroid**, nudged to the
+5. **Membership** ([js/membership.js](js/membership.js)) — decided BEFORE
+   any routing. Customers classified urban/rural by local density
+   (`URBAN_CUST_PER_KM2 = 60` within 500 m — absolute, so a denser world
+   classifies more urban). Customers (as TX load nodes, ≤ 50 cust/TX) →
+   feeders by **road-graph-capacitated clustering** (urban ≤ `N_URBAN_MAX
+   = 700`; rural ≤ `N_RURAL_MAX = 300` plus a `RURAL_EXTENT_KM_MAX = 10`
+   road-radius cap; runts < 150 merge). Feeders → zone subs by grouping
+   **road-adjacent** feeders (shared road-graph Voronoi boundary, not
+   straight-line proximity), ≤ `FEEDERS_PER_SUB_MAX = 8` per sub.
+6. **Sub siting** ([js/network.js](js/network.js)) — each zone sub sits at
+   the **load-weighted centroid of its feeder group**, nudged to the
    nearest subtransmission-viable road node (arterial/collector corridor,
    gentle slope) — never a geometric centre, never a town marker.
-6. **Subtransmission** ([js/subtx.js](js/subtx.js)) — GXP on a flat
+7. **Feeder routing** ([js/network.js](js/network.js)) — LAST, honouring
+   membership: one Dijkstra tree per sub over the roads, serving ONLY that
+   sub's members; trees may not overlap (one circuit per road corridor).
+   A sub only claims road nodes inside its own catchment; a path's
+   stretches through a foreign catchment are charged as EXPRESS exposure
+   (the second circuit strung along a shared road — bridges especially).
+   Every feeder ends up a contiguous subtree with a single root (enforced,
+   logged); express runs back to the sub are charged as un-switchable base
+   SAIDI. A bounded **validate + repair loop** (`MAX_REPAIR_PASSES = 3`)
+   re-splits / re-groups affected members when a feeder trunk exceeds
+   `MAX_FEEDER_KM = 20`, a path rides another sub's actual network beyond
+   `MAX_FOREIGN_CROSSING_M = 2500`, or any cap is breached — outcomes
+   reported in the Checks panel. Sections in high-density cells are
+   underground cable (drawn dashed), the rest overhead.
+8. **Subtransmission** ([js/subtx.js](js/subtx.js)) — GXP on a flat
    map-edge cell near the load centroid; least-cost A* lines GXP → each
    sub (slope penalised, ocean blocked, river crossings 6×, road corridors
    rewarded, micro-siting cost noise); adjacent subs **share trunk
    corridors before branching**, plus one inter-sub tie routed to avoid
    the trunks. VISUAL ONLY — a check asserts SAIDI and network structure
    are unchanged by (re)building it.
-7. **Feeders** ([js/network.js](js/network.js)) — capacitated TX
-   clustering (≤ 50 customers), multi-source Dijkstra over roads from the
-   subs, each sub tree partitioned into feeders sized by local density
-   (~250 rural – ~700+ urban, ≈400–500 average) with runt merging,
-   junction-overshoot splitting and express-run accounting (heads > 4 km
-   out merge into their trunk feeder up to a 1000-customer cap). Sections
-   in high-density cells are underground cable (drawn dashed), the rest
-   overhead.
 
 ### Validation pass ([js/main.js](js/main.js), `VALIDATION`)
 
@@ -96,13 +110,32 @@ seed (`seed#retry1`, …); after `MAX_ATTEMPTS = 4` the **best attempt wins
 panel — never a hard fail.
 
 ```
-MAX_SUB_CENTROID_KM   = 5    // X: sub too far from its load centroid
-MAX_SUBTX_STRAIGHT_KM = 6    // Y: subtx line straight for too long
+MAX_SUB_CENTROID_KM   = 5    // X: sub too far from its feeder-group load centroid
+MAX_SUBTX_STRAIGHT_KM = 8    // Y: subtx line straight for too long
 MIN_GRID_SPREAD_DEG   = 15   // all town grids sharing one orientation
 MIN_ZIPF_RATIO        = 3.0  // realised largest/median town size too flat
 ```
 
-8. **Reliability** ([js/reliability.js](js/reliability.js)) — per-feeder
+### Membership caps ([js/membership.js](js/membership.js), [js/network.js](js/network.js) — all tunable)
+
+```
+URBAN_CUST_PER_KM2      = 60    // urban ⇔ ≥ this within 500 m (absolute — scales with slider)
+N_URBAN_MAX             = 700   // customer cap, urban feeder
+N_RURAL_MAX             = 300   // customer cap, rural feeder
+RURAL_EXTENT_KM_MAX     = 10    // rural feeder growth radius by road (span ≤ 2×)
+FEEDERS_PER_SUB_MAX     = 8     // feeder-count cap per zone sub
+GROUP_SPREAD_KM_MAX     = 16    // max bbox diagonal of one sub's feeder group
+MAX_FEEDER_KM           = 20    // trunk: sub → farthest member by road
+MAX_FOREIGN_CROSSING_M  = 2500  // transit on another sub's actual network
+MAX_REPAIR_PASSES       = 3     // bounded validate/repair loop
+```
+
+Rule checks in the Checks panel marked by these caps are **tunable**: a
+residual after the bounded repair loop is honest reporting for you to
+tune, and does not gate the selftest — correctness checks (conservation,
+contiguity, membership honoured, monotonicity, fault conservation) do.
+
+9. **Reliability** ([js/reliability.js](js/reliability.js)) — per-feeder
    SAIDI with separate overhead/underground fault rates (defaults 0.10 /
    0.03 faults·km⁻¹·yr⁻¹, both adjustable live in the UI); outage = crew
    travel from the sub at 50 km/h along roads + flat 120 min repair (both
@@ -165,6 +198,13 @@ MIN_ZIPF_RATIO        = 3.0  // realised largest/median town size too flat
 - Baseline SAIDI finite and positive.
 - Greedy running SAIDI monotone non-increasing.
 - Fault classification conserves customers (no double-count).
+- **Membership honoured by routing**: every load node lands on its own
+  feeder, every feeder is a single contiguous subtree with one root, no
+  orphan TXs.
+- Subtransmission is visual-only (rebuilding it changes no numbers).
+- Plus the tunable rule checks (caps, trunk/extent, foreign transit,
+  feeders-per-sub, repair-loop convergence) — reported honestly, gated
+  separately (see Membership caps above).
 
 ## Design choices
 

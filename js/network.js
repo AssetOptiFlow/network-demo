@@ -1,114 +1,654 @@
 // network.js — electrical model: distribution transformers, zone
 // substations, and radial feeders routed ALONG the road graph.
 //
+// TWO-LEVEL MEMBERSHIP-FIRST FLOW (membership.js decides, this file routes):
+//   1. customers classified urban/rural (local density, cust/km²)
+//   2. customers → feeders: road-capacitated clustering (membership.js)
+//   3. feeders → zone subs: road-adjacent groups, ≤ FEEDERS_PER_SUB_MAX
+//   4. subs at the load-weighted centroid of their FEEDER GROUP, nudged to
+//      a subtransmission-viable corridor node (nudgeToCorridor, unchanged)
+//   5. routing LAST: one Dijkstra tree per sub over the roads, serving ONLY
+//      that sub's member load nodes; trees may not overlap (later subs
+//      route around earlier trees — one circuit per road corridor)
+//   6. validate + repair, bounded passes: feeder caps, rural extent,
+//      MAX_FEEDER_KM trunks, MAX_FOREIGN_CROSSING_M transit, group caps.
+//      Repairs re-cluster / re-group AFFECTED MEMBERS only; outcomes are
+//      reported in the Checks panel, never silently absorbed.
+//
 // ASSUMPTIONS:
 //  - Distribution transformers (TX): greedy capacitated clustering of
 //    customers, max 50 per TX, gathered within ~500 m (urban) / 1500 m
 //    (rural). TX sits at the road node nearest the cluster centroid.
-//  - Zone substations: one per ~4000 customers (1–6), sited at road nodes
-//    near customer-load centres (≥ 2.5 km apart), named for the nearest
-//    town. Multi-source Dijkstra over roads assigns every TX to its
-//    road-nearest sub.
-//  - Feeders: each sub's shortest-path tree is PARTITIONED into feeders
-//    sized by local linear customer density — target ~250 customers rural
-//    up to ~700 urban (≈400 average), matching the untidy way real
-//    networks split load. Each feeder head connects back to the sub by an
-//    "express" run of parallel circuit along the same roads; its fault
-//    exposure is charged to the feeder as un-switchable base SAIDI.
+//  - Structural soundness is enforced, not hoped for: every feeder is a
+//    contiguous subtree with a single root (forced splits otherwise, and
+//    trunk runts absorb into the feeder that surrounds them, both logged).
 //  - Sections through high-density cells are UNDERGROUND cable, the rest
-//    overhead line (per-type fault rates live in reliability.js).
+//    overhead (per-type fault rates live in reliability.js).
 //  - LV detail below the TX is ignored; customers hang off their TX.
+
+import {
+  classifyCustomers, buildLoadNodes, clusterFeeders, mergeRuntFeeders,
+  feederVoronoi, groupFeeders, NodeHeap, morton, capOf,
+  FEEDERS_PER_SUB_MAX, RURAL_EXTENT_KM_MAX, FEEDER_MIN_CUST,
+} from "./membership.js";
 
 export const TX_CAP = 50;
 // Town peaks sit near 1.0 (mass-compensated), so this keeps cable to the
 // inner core (roughly r < σ) rather than whole towns.
 export const UG_DENSITY_THRESH = 0.55; // density units — inner-urban ⇒ cable
-// Zone-sub sizing rules (k selection for the catchment k-means):
-//  - an urban sub serves at most ~4000 customers (oversize catchments split)
-//  - a rural sub can serve as few as 500 (smaller catchments merge)
-const SUB_MAX_CUST = 4000;
-const SUB_MIN_CUST = 500;
-const MAX_SUBS = 10;
-// Cut targets are set above the desired averages (rural ~250, urban ~700,
-// overall ~400) because overshoot-at-cut and small branch-root remainders
-// pull realised feeder sizes below the cut threshold.
-const FEEDER_TARGET_RURAL = 300, FEEDER_TARGET_URBAN = 780;
-const MIN_MERGE = 200;   // feeders below this merge into their largest child
-const MAX_MERGED = 1000; // …unless the result would exceed this
-// A feeder head more than this far (by road) from its sub would mean a
-// long parallel "express" circuit down one rural road — implausible, so
-// such feeders merge into the feeder that owns their trunk instead (long
-// single rural feeders are the realistic outcome, even over-size).
-const MAX_EXPRESS_M = 4000;
 
-// Density-scaled feeder size target: rural long skinny feeders carry fewer
-// customers, tight urban feeders carry more. Urban-ness = the stronger of
-// linear customer density (30→150 cust/km) and underground share (UG cable
-// exists exactly where density is high).
-function feederTarget(cust, lenM, ugLenM) {
-  const perKm = cust / Math.max(0.3, lenM / 1000);
-  const uDensity = Math.max(0, Math.min(1, (perKm - 30) / 120));
-  const uUg = Math.max(0, Math.min(1, (ugLenM / Math.max(1, lenM) - 0.15) / 0.5));
-  const u = Math.max(uDensity, uUg);
-  return FEEDER_TARGET_RURAL + u * (FEEDER_TARGET_URBAN - FEEDER_TARGET_RURAL);
-}
+// ---- validate/repair caps (named for tuning) ----------------------------
+// Measured on generated worlds: rural pockets 15–20 km by road and 1–2 km
+// arterial pass-throughs of a neighbouring catchment are structural on
+// this geography, so tighter values than these thrash the repair loop.
+export const MAX_FEEDER_KM = 20;           // sub → farthest member, by road
+export const MAX_FOREIGN_CROSSING_M = 2500; // transit through a foreign sub's catchment
+export const MAX_REPAIR_PASSES = 3;
+export const CAP_SLACK = 1.10;            // headroom before a cap counts as violated
+                                          // (trunk-load absorbs jitter counts upward)
+const MAX_SUBS = 24;                      // backstop for repair-created subs
+// A remote valley pocket this big justifies its own small rural sub when
+// no existing sub is closer — real utilities build them for exactly this.
+const NEW_SUB_MIN_CUST = 150;
 
-// STRICT LAYER ORDER: subs are placed FIRST (k-means catchments over the
-// load, see placeSubs) and passed in; feeders are the LAST layer, grown
-// from the subs over the road graph.
-export function buildNetwork(terrain, graph, customers, towns, density, subs, rng) {
-  // ---------- 1. capacitated TX clustering (greedy, deterministic)
+// =====================================================================
+// buildNetwork — membership first, routing last.
+// =====================================================================
+export function buildNetwork(terrain, graph, customers, towns, density, rng) {
+  // ---------- TX layer (atoms of load; unchanged)
   const txs = clusterTransformers(customers, rng);
-  for (const tx of txs) {
-    tx.node = graph.nearestNode(tx.x, tx.y, 30000).id;
+  for (const tx of txs) tx.node = graph.nearestNode(tx.x, tx.y, 30000).id;
+  for (const tx of txs) for (const ci of tx.customers) customers[ci].tx = tx.id;
+
+  // ---------- MEMBERSHIP (steps 1–3) — before any routing
+  const classOfCust = classifyCustomers(customers);
+  const loadNodes = buildLoadNodes(txs, customers, classOfCust);
+  let cf = clusterFeeders(graph, loadNodes);
+  cf = mergeRuntFeeders(graph, loadNodes, cf.feederOf, cf.feeders);
+  const g0 = groupFeeders(graph, loadNodes, cf.feederOf, cf.feeders.length);
+  // Mutable membership state: feederOf per load node + group per feeder id.
+  const M = {
+    feederOf: cf.feederOf,
+    fidGroup: new Map(cf.feeders.map(f => [f.id, g0.groupOf[f.id]])),
+    nextFid: cf.feeders.length,
+  };
+
+  // ---------- ROUTE → VALIDATE → REPAIR (bounded, affected members only)
+  const repairLog = [];
+  let built = null;
+  for (let pass = 0; ; pass++) {
+    const mem = materialise(loadNodes, M);
+    const subs = placeSubsForGroups(terrain, graph, towns, loadNodes, mem);
+    built = routeMembership(terrain, graph, density, loadNodes, mem, subs, M, repairLog, pass);
+    const viol = validateMembership(graph, loadNodes, built);
+    // runt merging is tidying, not a rule breach — repaired but never
+    // reported as an unresolved violation
+    built.violations = viol.filter(v => v.kind !== "runt");
+    if (!viol.length || pass >= MAX_REPAIR_PASSES) {
+      if (built.violations.length) {
+        repairLog.push({ pass, action: "unresolved",
+          detail: built.violations.map(v => v.detail).join("; ") });
+      }
+      break;
+    }
+    applyRepairs(graph, loadNodes, M, built, viol, repairLog, pass);
   }
 
-  // ---------- 3. multi-source Dijkstra over road graph
+  return finishNet(graph, customers, txs, loadNodes, built, classOfCust, repairLog);
+}
+
+// Compact the mutable membership state into dense ids (0..n-1) + metadata.
+// Group ids are compacted too (a group can empty out after a repair move).
+function materialise(loadNodes, M) {
+  const liveFids = [...new Set([...M.feederOf].filter(f => f !== -1))].sort((a, b) => a - b);
+  const fidTo = new Map(liveFids.map((f, i) => [f, i]));
+  const liveGroups = [...new Set(liveFids.map(f => M.fidGroup.get(f)))].sort((a, b) => a - b);
+  const groupTo = new Map(liveGroups.map((g, i) => [g, i]));
+  const feeders = liveFids.map((oldFid, id) => ({
+    id, oldFid, cust: 0, urbanCust: 0, urban: false,
+    group: groupTo.get(M.fidGroup.get(oldFid)),
+    loadIdx: [],
+  }));
+  const feederOf = new Int32Array(loadNodes.length).fill(-1);
+  for (let i = 0; i < loadNodes.length; i++) {
+    if (M.feederOf[i] === -1) continue;
+    const f = feeders[fidTo.get(M.feederOf[i])];
+    feederOf[i] = f.id;
+    f.cust += loadNodes[i].cust;
+    f.urbanCust += loadNodes[i].urbanCust;
+    f.loadIdx.push(i);
+  }
+  for (const f of feeders) f.urban = f.urbanCust * 2 >= f.cust;
+  return { feederOf, feeders, nGroups: liveGroups.length, rawGroupOf: liveGroups };
+}
+
+// ---------------------------------------------------------------------
+// Step 4 — sub per feeder group: LOAD-WEIGHTED centroid of the group's
+// member load nodes (never a geometric centre), nudged to the nearest
+// subtransmission-viable corridor node (existing nudge logic, unchanged).
+// ---------------------------------------------------------------------
+function placeSubsForGroups(terrain, graph, towns, loadNodes, mem) {
+  const subs = [];
+  for (let g = 0; g < mem.nGroups; g++) {
+    let sx = 0, sy = 0, cust = 0, nFeeders = 0;
+    for (const f of mem.feeders) {
+      if (f.group !== g) continue;
+      nFeeders++;
+      for (const li of f.loadIdx) {
+        const ln = loadNodes[li];
+        sx += graph.nx[ln.node] * ln.cust;
+        sy += graph.ny[ln.node] * ln.cust;
+        cust += ln.cust;
+      }
+    }
+    const cx = sx / Math.max(1, cust), cy = sy / Math.max(1, cust);
+    const node = nudgeToCorridor(terrain, graph, cx, cy, subs);
+    let town = towns[0], bd = Infinity;
+    for (const t of towns) {
+      const d = Math.hypot(t.x - cx, t.y - cy);
+      if (d < bd) { bd = d; town = t; }
+    }
+    const dupes = subs.filter(s => s.baseName === town.name).length;
+    subs.push({
+      id: g, node, x: graph.nx[node], y: graph.ny[node],
+      centroidX: cx, centroidY: cy, catchment: cust, nFeeders,
+      baseName: town.name,
+      name: town.name + (dupes ? " " + "BCDEFG"[dupes - 1] : ""),
+    });
+  }
+  return subs;
+}
+
+// ---------------------------------------------------------------------
+// Step 5 — routing LAST, honouring membership. One UNBLOCKED Dijkstra per
+// sub over the road graph, serving only its member load nodes — true
+// shortest paths. A sub may only CLAIM (own tree edges on) nodes inside
+// its OWN catchment (road-graph Voronoi over the membership tables); a
+// path's stretches through a foreign catchment are charged to the feeder
+// as EXPRESS exposure — the second circuit strung along a shared road,
+// policed by the MAX_FOREIGN_CROSSING_M rule. Because every load node is
+// in its own sub's catchment by construction, no member can be claimed
+// away — membership is honoured exactly.
+// Within each sub's claimed forest, node ownership is sticky top-down
+// with a HARD rule at load nodes, and every feeder ends as a contiguous
+// subtree with a single root (forced splits / runt absorbs, logged).
+// ---------------------------------------------------------------------
+function routeMembership(terrain, graph, density, loadNodes, mem, subs, M, repairLog, pass) {
   const nN = graph.nNodes;
+  const loadAt = new Map(loadNodes.map((ln, i) => [ln.node, i]));
+  const subOrder = subs.slice().sort((a, b) => b.catchment - a.catchment || a.id - b.id);
+
+  // sub catchment label per road node (feeder Voronoi → that feeder's sub)
+  const fLabel = feederVoronoi(graph, loadNodes, mem.feederOf);
+  const subLabel = new Int32Array(nN).fill(-1);
+  for (let v = 0; v < nN; v++) {
+    if (fLabel[v] !== -1) subLabel[v] = mem.feeders[fLabel[v]].group;
+  }
+
   const dist = new Float64Array(nN).fill(Infinity);
   const parent = new Int32Array(nN).fill(-1);
   const parentEdge = new Int32Array(nN).fill(-1);
-  const subOf = new Int32Array(nN).fill(-1);
-  const heap = new NodeHeap();
-  for (const s of subs) {
-    dist[s.node] = 0; subOf[s.node] = s.id;
+  const claimed = new Int32Array(nN).fill(-1);
+  const usedEdge = new Uint8Array(graph.edges.length);
+  const midDistNode = new Float64Array(nN);
+  const perSubClaimed = subs.map(() => []);
+  const subChains = subs.map(() => null);
+  for (const s of subs) { claimed[s.node] = s.id; dist[s.node] = 0; }
+
+  const sd = new Float64Array(nN), sparent = new Int32Array(nN),
+    sparentEdge = new Int32Array(nN), stamp = new Int32Array(nN);
+  let gen = 0;
+  for (const s of subOrder) {
+    // full-graph Dijkstra from the sub — true shortest paths, no blocking
+    gen++;
+    const heap = new NodeHeap();
+    sd[s.node] = 0; sparent[s.node] = -1; sparentEdge[s.node] = -1; stamp[s.node] = gen;
     heap.push(0, s.node);
+    const done = new Set();
+    while (heap.size) {
+      const v = heap.pop();
+      if (done.has(v)) continue;
+      done.add(v);
+      for (const ei of graph.adj[v]) {
+        const e = graph.edges[ei];
+        const w = e.a === v ? e.b : e.a;
+        const nd = sd[v] + e.len;
+        if (stamp[w] !== gen || nd < sd[w] - 1e-9) {
+          stamp[w] = gen; sd[w] = nd; sparent[w] = v; sparentEdge[w] = ei;
+          heap.push(nd, w);
+        }
+      }
+    }
+    // PHASE 1: claim the own-catchment portion of each member's path;
+    // stretches in foreign catchments are skipped for now
+    for (let li = 0; li < loadNodes.length; li++) {
+      const fid = mem.feederOf[li];
+      if (fid === -1 || mem.feeders[fid].group !== s.id) continue;
+      for (let v = loadNodes[li].node; v !== s.node && claimed[v] !== s.id; v = sparent[v]) {
+        if (claimed[v] === -1 && subLabel[v] === s.id) {
+          claimed[v] = s.id;
+          perSubClaimed[s.id].push(v);
+          dist[v] = sd[v]; parent[v] = sparent[v]; parentEdge[v] = sparentEdge[v];
+          midDistNode[v] = (sd[v] + sd[sparent[v]]) / 2;
+          usedEdge[sparentEdge[v]] = 1;
+        }
+      }
+    }
+    // keep this sub's full parent chains + distances — phase 2, express
+    // runs and transit measurements need the true path everywhere
+    subChains[s.id] = { par: sparent.slice(), edge: sparentEdge.slice(), sdist: sd.slice() };
   }
-  while (heap.size) {
-    const v = heap.pop();
-    for (const ei of graph.adj[v]) {
-      const e = graph.edges[ei];
-      const w = e.a === v ? e.b : e.a;
-      const nd = dist[v] + e.len;
-      if (nd < dist[w] - 1e-9) {
-        dist[w] = nd; parent[w] = v; parentEdge[w] = ei; subOf[w] = subOf[v];
-        heap.push(nd, w);
+
+  // PHASE 2: foreign-catchment stretches whose nodes the HOME sub never
+  // uses are claimed by the crossing sub — the feeder passes through as
+  // one contiguous circuit. Only genuinely shared segments (both subs on
+  // the same road, e.g. a bridge) stay foreign: there the far side splits
+  // into its own feeder with an express run back — the second circuit.
+  for (const s of subOrder) {
+    const chain = subChains[s.id];
+    for (let li = 0; li < loadNodes.length; li++) {
+      const fid = mem.feederOf[li];
+      if (fid === -1 || mem.feeders[fid].group !== s.id) continue;
+      for (let v = loadNodes[li].node; v !== s.node && v !== -1; v = chain.par[v]) {
+        if (claimed[v] === -1) {
+          claimed[v] = s.id;
+          perSubClaimed[s.id].push(v);
+          dist[v] = chain.sdist[v]; parent[v] = chain.par[v]; parentEdge[v] = chain.edge[v];
+          midDistNode[v] = (chain.sdist[v] + chain.sdist[chain.par[v]]) / 2;
+          usedEdge[chain.edge[v]] = 1;
+        }
       }
     }
   }
 
-  // ---------- 4. prune to the union of TX→sub paths
-  const usedEdge = new Uint8Array(graph.edges.length);
-  const custAtNode = new Float64Array(nN);
-  let orphanTx = 0;
-  for (const tx of txs) {
-    if (tx.node === -1 || !isFinite(dist[tx.node])) { orphanTx++; continue; }
-    tx.sub = subOf[tx.node];
-    custAtNode[tx.node] += tx.customers.length;
-    for (let v = tx.node; parent[v] !== -1; v = parent[v]) {
-      if (usedEdge[parentEdge[v]]) break; // rest of path already marked
-      usedEdge[parentEdge[v]] = 1;
+  // ---- per-sub tree orders (parent-before-child) + node ownership.
+  // Ownership works on RAW feeder ids (M.feederOf) so that id compaction
+  // during structural mutations cannot skew earlier subs' results; compact
+  // ids are assigned once, at the end.
+  const ownerOld = new Int32Array(nN).fill(-1);
+  const kids = new Map(); // node -> child nodes (within claimed forests)
+  for (let v = 0; v < nN; v++) {
+    if (claimed[v] === -1 || parent[v] === -1) continue;
+    let arr = kids.get(parent[v]);
+    if (!arr) kids.set(parent[v], arr = []);
+    arr.push(v);
+  }
+  const subNodeOrder = subs.map(() => []);
+  let forcedSplits = 0, trunkAbsorbs = 0;
+  for (const s of subs) {
+    ownerOld[s.node] = -2; // busbar
+    // parent-before-child order over THIS sub's claimed forest. A claimed
+    // node whose parent is foreign-claimed starts its own component (its
+    // path continues upstream as express through the foreign corridor).
+    const sameSub = (v) => v !== -1 && claimed[v] === s.id && v !== s.node;
+    const st = [...(kids.get(s.node) ?? []).filter(w => claimed[w] === s.id)];
+    for (const v of perSubClaimed[s.id]) {
+      const p = parent[v];
+      if (p !== s.node && !sameSub(p)) st.push(v); // boundary root
+    }
+    const order = [];
+    while (st.length) {
+      const v = st.pop();
+      order.push(v);
+      for (const w of kids.get(v) ?? []) if (claimed[w] === s.id) st.push(w);
+    }
+    subNodeOrder[s.id] = order;
+
+    // Top-down ownership. HARD RULE: a load node always belongs to its
+    // own member feeder — series segments along one corridor keep their
+    // identity (the downstream feeder reaches past on an express run),
+    // exactly like real parallel circuits. Pass-through nodes: sticky
+    // to the parent's feeder while it still has members below, else the
+    // dominant feeder below this node.
+    const deriveOwnership = () => {
+      const fcust = new Map(order.map(v => [v, new Map()]));
+      for (let i = order.length - 1; i >= 0; i--) {
+        const v = order[i];
+        const m = fcust.get(v);
+        const li = loadAt.get(v);
+        if (li !== undefined && M.feederOf[li] !== -1) {
+          m.set(M.feederOf[li], (m.get(M.feederOf[li]) ?? 0) + loadNodes[li].cust);
+        }
+        const p = parent[v];
+        if (sameSub(p)) {
+          const pm = fcust.get(p);
+          for (const [f, c] of m) pm.set(f, (pm.get(f) ?? 0) + c);
+        }
+      }
+      for (const v of order) {
+        const p = parent[v];
+        const pOwn = sameSub(p) ? ownerOld[p] : -1;
+        const m = fcust.get(v);
+        const liV = loadAt.get(v);
+        let o = -1;
+        if (liV !== undefined && M.feederOf[liV] !== -1) o = M.feederOf[liV];
+        else if (pOwn >= 0 && (m.get(pOwn) ?? 0) > 0) o = pOwn;
+        else {
+          let bc = -1;
+          for (const [f, c] of m) if (c > bc || (c === bc && f < o)) { bc = c; o = f; }
+        }
+        ownerOld[v] = o;
+      }
+    };
+    // components of one raw feeder id, largest-customer first
+    const componentsOf = () => {
+      const rootsOf = new Map(); // raw feeder id -> [root nodes]
+      for (const v of order) {
+        const f = ownerOld[v];
+        if (f < 0) continue;
+        const p = parent[v];
+        if (!sameSub(p) || ownerOld[p] !== f) {
+          if (!rootsOf.has(f)) rootsOf.set(f, []);
+          rootsOf.get(f).push(v);
+        }
+      }
+      const out = [];
+      for (const [f, roots] of rootsOf) {
+        if (roots.length <= 1) continue;
+        const comps = roots.map(r => {
+          const nodes = [], stc = [r];
+          let cust = 0;
+          while (stc.length) {
+            const v = stc.pop();
+            nodes.push(v);
+            const li = loadAt.get(v);
+            if (li !== undefined && M.feederOf[li] === f) cust += loadNodes[li].cust;
+            for (const w of kids.get(v) ?? []) if (claimed[w] === s.id && ownerOld[w] === f) stc.push(w);
+          }
+          return { f, root: r, nodes, cust };
+        }).sort((a, b) => b.cust - a.cust || a.root - b.root);
+        out.push(comps);
+      }
+      return out;
+    };
+
+    // settle ownership; early rounds may absorb runt components upstream —
+    // but never past the receiving feeder's cap (absorb jitter otherwise
+    // re-inflates trunk feeders every pass)
+    for (let round = 0; round < 6; round++) {
+      deriveOwnership();
+      const custOf = new Map(), urbOf = new Map();
+      for (let i = 0; i < loadNodes.length; i++) {
+        const f = M.feederOf[i];
+        if (f === -1) continue;
+        custOf.set(f, (custOf.get(f) ?? 0) + loadNodes[i].cust);
+        urbOf.set(f, (urbOf.get(f) ?? 0) + loadNodes[i].urbanCust);
+      }
+      const capOfFid = (f) => capOf((urbOf.get(f) ?? 0) * 2 >= (custOf.get(f) ?? 0));
+      let changed = false;
+      for (const comps of componentsOf()) {
+        for (const comp of comps.slice(1)) {
+          const pr = parent[comp.root];
+          const upstream = sameSub(pr) ? ownerOld[pr] : -1;
+          if (comp.cust < FEEDER_MIN_CUST && upstream >= 0 &&
+              (custOf.get(upstream) ?? 0) + comp.cust <= capOfFid(upstream)) {
+            for (const v of comp.nodes) {
+              const li = loadAt.get(v);
+              if (li !== undefined && M.feederOf[li] === comp.f) M.feederOf[li] = upstream;
+            }
+            custOf.set(upstream, (custOf.get(upstream) ?? 0) + comp.cust);
+            trunkAbsorbs++;
+            changed = true;
+          }
+        }
+      }
+      if (!changed) break;
+    }
+    // component-materialise sweep: contiguity GUARANTEED by construction —
+    // extra components become new feeders with nodes reassigned directly,
+    // and ownership is NOT re-derived afterwards.
+    deriveOwnership();
+    for (const comps of componentsOf()) {
+      for (const comp of comps.slice(1)) {
+        const newFid = M.nextFid++;
+        M.fidGroup.set(newFid, M.fidGroup.get(comp.f));
+        for (const v of comp.nodes) {
+          ownerOld[v] = newFid;
+          const li = loadAt.get(v);
+          if (li !== undefined && M.feederOf[li] === comp.f) M.feederOf[li] = newFid;
+        }
+        forcedSplits++;
+      }
     }
   }
+  if (forcedSplits || trunkAbsorbs) {
+    repairLog.push({ pass, action: "structural enforcement",
+      detail: `${trunkAbsorbs} runt component(s) absorbed, ${forcedSplits} forced feeder split(s)` });
+  }
 
-  // ---------- 5. partition each sub tree into feeders (~400 cust target)
+  // compact ids once, after all structural mutations
+  const memF = materialise(loadNodes, M);
+  const oldToNew = new Map(memF.feeders.map(f => [f.oldFid, f.id]));
   const feederOfNode = new Int32Array(nN).fill(-1);
-  const subtreeCust = new Float64Array(nN); // FEEDER-LOCAL subtree customers
-  const accCust = new Float64Array(nN);
-  const accLen = new Float64Array(nN);
-  const accUg = new Float64Array(nN);
-  const allOrder = []; // parent-before-child, contiguous per sub
-  const rawFeeders = []; // {sub, rootNode, cust} before runt merging
+  for (let v = 0; v < nN; v++) {
+    if (ownerOld[v] === -2) feederOfNode[v] = -2;
+    else if (ownerOld[v] >= 0) feederOfNode[v] = oldToNew.get(ownerOld[v]) ?? -1;
+  }
+
+  return {
+    mem: memF, subs, subNodeOrder, subChains, midDistNode, subLabel,
+    dist, parent, parentEdge, claimed, usedEdge, feederOfNode,
+    terrain, density,
+  };
+}
+
+// Move one load node's membership to the road-nearest feeder of a given
+// sub (or of any OTHER sub when subId is -1).
+function moveToNearestFeeder(graph, loadNodes, mem, M, li, subId) {
+  const heap = new NodeHeap();
+  const dist = new Map([[loadNodes[li].node, 0]]);
+  heap.push(0, loadNodes[li].node);
+  const loadAt = new Map(loadNodes.map((ln, i) => [ln.node, i]));
+  const seen = new Set();
+  while (heap.size) {
+    const v = heap.pop();
+    if (seen.has(v)) continue;
+    seen.add(v);
+    const lj = loadAt.get(v);
+    if (lj !== undefined && lj !== li && mem.feederOf[lj] !== -1 &&
+        mem.feederOf[lj] !== mem.feederOf[li] &&
+        (subId === -1
+          ? mem.feeders[mem.feederOf[lj]].group !== mem.feeders[mem.feederOf[li]]?.group
+          : mem.feeders[mem.feederOf[lj]].group === subId)) {
+      M.feederOf[li] = mem.feeders[mem.feederOf[lj]].oldFid;
+      return true;
+    }
+    for (const ei of graph.adj[v]) {
+      const e = graph.edges[ei];
+      const w = e.a === v ? e.b : e.a;
+      const nd = dist.get(v) + e.len;
+      if (nd < (dist.get(w) ?? Infinity)) { dist.set(w, nd); heap.push(nd, w); }
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------
+// Step 6 — validation rules (named caps above). Violations feed repairs;
+// whatever survives MAX_REPAIR_PASSES is reported, never hidden.
+// ---------------------------------------------------------------------
+function validateMembership(graph, loadNodes, built) {
+  const { mem, subs, dist, feederOfNode } = built;
+  const viol = [];
+  for (const f of mem.feeders) {
+    const cap = capOf(f.urban);
+    // tiny fragments only — genuine small leaf feeders are realistic and
+    // kept; TINY_FEEDER guards against split debris
+    const TINY_FEEDER = 50;
+    if (f.cust < TINY_FEEDER && mem.feeders.filter(x => x.group === f.group).length > 1) {
+      viol.push({ kind: "runt", feeder: f.id, lis: f.loadIdx.slice(),
+        detail: `F${f.id} only ${f.cust} cust (< ${TINY_FEEDER})` });
+    }
+    if (f.cust > cap * CAP_SLACK) {
+      viol.push({ kind: "cap", feeder: f.id,
+        detail: `F${f.id} ${f.cust} cust > ${f.urban ? "urban" : "rural"} cap ${cap}` });
+    }
+    let maxD = 0, minD = Infinity;
+    for (const li of f.loadIdx) {
+      const d = dist[loadNodes[li].node];
+      if (isFinite(d)) { maxD = Math.max(maxD, d); minD = Math.min(minD, d); }
+    }
+    f.trunkKm = +(maxD / 1000).toFixed(2);
+    if (maxD / 1000 > MAX_FEEDER_KM) {
+      viol.push({ kind: "trunk", feeder: f.id,
+        detail: `F${f.id} trunk ${(maxD / 1000).toFixed(1)} km > ${MAX_FEEDER_KM} km` });
+    } else if (!f.urban && (maxD - minD) / 1000 > 2 * RURAL_EXTENT_KM_MAX * CAP_SLACK) {
+      // RURAL_EXTENT_KM_MAX is a growth RADIUS; the member span can
+      // legitimately reach twice that
+      viol.push({ kind: "extent", feeder: f.id,
+        detail: `F${f.id} rural span ${((maxD - minD) / 1000).toFixed(1)} km > 2×${RURAL_EXTENT_KM_MAX} km` });
+    }
+    // foreign-NETWORK transit along the feeder's TRUE sub→member paths:
+    // only stretches on another sub's actual tree count (crossing empty
+    // countryside that merely LABELS foreign is harmless). The visited
+    // set counts shared trunk segments once, not per member.
+    const transit = new Map();
+    const visited = new Set();
+    const chain = built.subChains[f.group];
+    const subNode = subs[f.group].node;
+    for (const li of f.loadIdx) {
+      for (let v = loadNodes[li].node; v !== subNode && v !== -1 && !visited.has(v);) {
+        visited.add(v);
+        const ei = chain.edge[v];
+        const cl = built.claimed[v];
+        if (cl !== -1 && cl !== f.group && ei !== -1) {
+          transit.set(cl, (transit.get(cl) ?? 0) + graph.edges[ei].len);
+        }
+        v = chain.par[v];
+      }
+    }
+    for (const [foreignSub, len] of transit) {
+      if (len > MAX_FOREIGN_CROSSING_M) {
+        viol.push({ kind: "foreign", feeder: f.id, foreignSub,
+          detail: `F${f.id} transits sub ${foreignSub} catchment for ${(len / 1000).toFixed(1)} km > ${MAX_FOREIGN_CROSSING_M / 1000} km` });
+        break;
+      }
+    }
+  }
+  for (const s of subs) {
+    const n = mem.feeders.filter(f => f.group === s.id).length;
+    if (n > FEEDERS_PER_SUB_MAX) {
+      viol.push({ kind: "group", sub: s.id,
+        detail: `sub ${s.name} has ${n} feeders > ${FEEDERS_PER_SUB_MAX}` });
+    }
+  }
+  return viol;
+}
+
+// Repairs loop back to steps 2–3 for AFFECTED MEMBERS only.
+function applyRepairs(graph, loadNodes, M, built, viol, repairLog, pass) {
+  const { mem, subs } = built;
+  const applied = [];
+  for (const v of viol) {
+    if (v.kind === "runt") {
+      // fold a runt feeder into its road-nearest same-sub neighbour
+      const f = mem.feeders[v.feeder];
+      let moved = 0;
+      for (const li of v.lis) {
+        if (moveToNearestFeeder(graph, loadNodes, mem, M, li, f.group) ||
+            moveToNearestFeeder(graph, loadNodes, mem, M, li, -1)) moved++;
+      }
+      applied.push(`runt: F${v.feeder} (${f.cust} cust) folded into neighbours (${moved} node(s))`);
+    } else if (v.kind === "cap" || v.kind === "extent") {
+      // re-split this feeder's members with the same road-capacitated growth
+      const f = mem.feeders[v.feeder];
+      const allowed = new Set(f.loadIdx);
+      const re = clusterFeeders(graph, loadNodes, allowed, M.nextFid);
+      M.nextFid += re.feeders.length;
+      for (const nf of re.feeders) M.fidGroup.set(nf.id, M.fidGroup.get(f.oldFid));
+      for (const li of f.loadIdx) if (re.feederOf[li] !== -1) M.feederOf[li] = re.feederOf[li];
+      applied.push(`${v.kind}: F${v.feeder} re-split into ${re.feeders.length}`);
+    } else if (v.kind === "trunk") {
+      // far members become their own feeder, homed to the nearest sub with
+      // group headroom (possibly a brand-new sub)
+      const f = mem.feeders[v.feeder];
+      const far = f.loadIdx.filter(li => built.dist[loadNodes[li].node] > MAX_FEEDER_KM * 1000 * 0.8);
+      if (!far.length) continue;
+      let sx = 0, sy = 0, c = 0;
+      for (const li of far) {
+        sx += graph.nx[loadNodes[li].node] * loadNodes[li].cust;
+        sy += graph.ny[loadNodes[li].node] * loadNodes[li].cust;
+        c += loadNodes[li].cust;
+      }
+      sx /= c; sy /= c;
+      // nearest OTHER sub, headroom preferred; the pocket only moves when
+      // that sub is genuinely closer to it than its own sub
+      const dOwn = Math.hypot(subs[f.group].x - sx, subs[f.group].y - sy);
+      let bestG = -1, bd = Infinity;
+      for (const s of subs) {
+        if (s.id === f.group) continue;
+        const n = mem.feeders.filter(x => x.group === s.id).length;
+        const d = Math.hypot(s.x - sx, s.y - sy) + (n < FEEDERS_PER_SUB_MAX ? 0 : 3000);
+        if (d < bd) { bd = d; bestG = s.id; }
+      }
+      const newFid = M.nextFid++;
+      const groupCount = new Set([...M.fidGroup.values()]).size;
+      const donorFid = bestG !== -1 && bd < dOwn
+        ? mem.feeders.find(x => x.group === bestG).oldFid // reuse that group's key
+        : null;
+      // a brand-new sub only for a pocket big enough to justify one
+      const spawnSub = donorFid === null && c >= NEW_SUB_MIN_CUST && groupCount < MAX_SUBS;
+      if (donorFid === null && !spawnSub) {
+        // last resort: each far member re-homes to the road-nearest
+        // feeder of any other sub
+        let moved = 0;
+        for (const li of far) if (moveToNearestFeeder(graph, loadNodes, mem, M, li, -1)) moved++;
+        applied.push(`trunk: F${v.feeder} far pocket (${c} cust) — ${moved} member(s) re-homed by road`);
+        continue;
+      }
+      M.fidGroup.set(newFid,
+        donorFid !== null ? M.fidGroup.get(donorFid)
+          : Math.max(...M.fidGroup.values()) + 1);
+      for (const li of far) M.feederOf[li] = newFid;
+      applied.push(`trunk: F${v.feeder} far pocket (${c} cust) → ` +
+        (donorFid !== null ? `sub group ${bestG}` : "new sub"));
+    } else if (v.kind === "foreign") {
+      // whole feeder moves to the sub it keeps transiting, if it has room
+      // (unconditional moves churn the grouping and never settle); else
+      // just the members BEYOND the transit re-home to that sub
+      const f = mem.feeders[v.feeder];
+      const n = mem.feeders.filter(x => x.group === v.foreignSub).length;
+      const donor = mem.feeders.find(x => x.group === v.foreignSub);
+      if (donor && n < FEEDERS_PER_SUB_MAX) {
+        M.fidGroup.set(f.oldFid, M.fidGroup.get(donor.oldFid));
+        applied.push(`foreign: F${v.feeder} moved to sub ${v.foreignSub}`);
+      } else if (donor) {
+        const chain = built.subChains[f.group];
+        let moved = 0;
+        for (const li of f.loadIdx) {
+          let crosses = false;
+          for (let w = loadNodes[li].node; w !== -1 && w !== subs[f.group].node; w = chain.par[w]) {
+            if (built.claimed[w] === v.foreignSub) { crosses = true; break; }
+          }
+          if (crosses && moveToNearestFeeder(graph, loadNodes, mem, M, li, v.foreignSub)) moved++;
+        }
+        applied.push(`foreign: F${v.feeder} — ${moved} member(s) beyond the transit re-homed to sub ${v.foreignSub}`);
+      }
+    } else if (v.kind === "group") {
+      // split the oversize group in two by Morton order of feeder seeds
+      const members = mem.feeders.filter(f => f.group === v.sub)
+        .sort((a, b) => {
+          const na = loadNodes[a.loadIdx[0]].node, nb = loadNodes[b.loadIdx[0]].node;
+          return morton(graph.nx[na], graph.ny[na]) - morton(graph.nx[nb], graph.ny[nb]);
+        });
+      const half = Math.ceil(members.length / 2);
+      const newGroup = Math.max(...M.fidGroup.values()) + 1;
+      for (const f of members.slice(half)) M.fidGroup.set(f.oldFid, newGroup);
+      applied.push(`group: sub ${v.sub} split (${members.length} → ${half}+${members.length - half} feeders)`);
+    }
+  }
+  repairLog.push({ pass, action: "repairs", detail: applied.join("; ") || "none applicable" });
+}
+
+// ---------------------------------------------------------------------
+// Final assembly: tree edges, feeder objects, express runs, membership
+// tables + check entries. Interface identical to the routing-first model.
+// ---------------------------------------------------------------------
+function finishNet(graph, customers, txs, loadNodes, built, classOfCust, repairLog) {
+  const { mem, subs, subNodeOrder, dist, parent, parentEdge, usedEdge, feederOfNode,
+    terrain, density } = built;
+  const nN = graph.nNodes;
+  const loadAt = new Map(loadNodes.map((ln, i) => [ln.node, i]));
 
   const gridN = terrain.n;
   const isUnderground = (a, b) => {
@@ -118,150 +658,23 @@ export function buildNetwork(terrain, graph, customers, towns, density, subs, rn
     return density.grid[cy * gridN + cx] > UG_DENSITY_THRESH;
   };
 
-  for (const s of subs) {
-    feederOfNode[s.node] = -2; // sub busbar: not on any single feeder
-    const order = [];
-    const stack = [];
-    for (const ei of graph.adj[s.node]) {
-      if (!usedEdge[ei]) continue;
-      const e = graph.edges[ei];
-      const child = e.a === s.node ? e.b : e.a;
-      if (parent[child] === s.node) stack.push(child);
-    }
-    while (stack.length) {
-      const v = stack.pop();
-      order.push(v);
-      for (const ej of graph.adj[v]) {
-        if (!usedEdge[ej]) continue;
-        const e2 = graph.edges[ej];
-        const w = e2.a === v ? e2.b : e2.a;
-        if (parent[w] === v) stack.push(w);
-      }
-    }
-    // Reverse (post-order) accumulate + cut into feeders. At junctions the
-    // combined total can leap far past the target ("overshoot"), so large
-    // child subtrees are split off as their own feeders first.
-    const cutFeeder = new Map(); // node -> raw feeder id
-    for (let i = order.length - 1; i >= 0; i--) {
-      const v = order[i];
-      const ownLen = graph.edges[parentEdge[v]].len;
-      let cust = custAtNode[v], len = ownLen;
-      let ug = isUnderground(v, parent[v]) ? ownLen : 0;
-      const kids = [];
-      for (const ej of graph.adj[v]) {
-        if (!usedEdge[ej]) continue;
-        const e2 = graph.edges[ej];
-        const w = e2.a === v ? e2.b : e2.a;
-        if (parent[w] === v && !cutFeeder.has(w)) kids.push(w);
-      }
-      for (const w of kids) { cust += accCust[w]; len += accLen[w]; ug += accUg[w]; }
-      let guard = kids.length;
-      while (guard-- > 0 && cust >= 1.3 * feederTarget(cust, len, ug)) {
-        let big = -1;
-        for (const w of kids) {
-          if (cutFeeder.has(w)) continue;
-          if (big === -1 || accCust[w] > accCust[big]) big = w;
-        }
-        if (big === -1 || accCust[big] < MIN_MERGE) break;
-        cutFeeder.set(big, rawFeeders.length);
-        rawFeeders.push({ sub: s.id, rootNode: big, cust: accCust[big] });
-        cust -= accCust[big]; len -= accLen[big]; ug -= accUg[big];
-      }
-      accCust[v] = cust; accLen[v] = len; accUg[v] = ug;
-      const isBranchRoot = parent[v] === s.node;
-      if (isBranchRoot || cust >= feederTarget(cust, len, ug)) {
-        cutFeeder.set(v, rawFeeders.length);
-        rawFeeders.push({ sub: s.id, rootNode: v, cust });
-      }
-    }
-    // Top-down feeder assignment (order is parent-before-child).
-    for (const v of order) {
-      feederOfNode[v] = cutFeeder.has(v) ? cutFeeder.get(v) : feederOfNode[parent[v]];
-    }
-    allOrder.push(...order);
-  }
+  let feeders = mem.feeders.map(f => ({
+    id: f.id, sub: f.group, rootNode: -1, urban: f.urban, trunkKm: f.trunkKm ?? 0,
+    nodes: [], edges: [], customers: 0,
+    lengthM: 0, ohLenM: 0, ugLenM: 0, txCount: 0,
+    expressOhKm: 0, expressUgKm: 0, expressMidM: 0,
+  }));
 
-  // Merge runt feeders (usually the trunk remainder above the last cut,
-  // occasionally left with 0 customers) into their largest child feeder —
-  // the child's root moves up to absorb the trunk.
-  const mergedInto = new Int32Array(rawFeeders.length).fill(-1);
-  const resolve = (fid) => { while (mergedInto[fid] !== -1) fid = mergedInto[fid]; return fid; };
-  for (let pass = 0, changed = true; changed && pass < rawFeeders.length; pass++) {
-    changed = false;
-    const cust = new Float64Array(rawFeeders.length);
-    for (let i = 0; i < rawFeeders.length; i++) cust[resolve(i)] += rawFeeders[i].cust;
-    for (let i = 0; i < rawFeeders.length; i++) {
-      if (mergedInto[i] !== -1 || cust[i] >= MIN_MERGE) continue;
-      let best = -1;
-      for (let g = 0; g < rawFeeders.length; g++) {
-        if (g === i || mergedInto[g] !== -1) continue;
-        const pn = parent[rawFeeders[g].rootNode];
-        if (pn === -1) continue;
-        const above = feederOfNode[pn];
-        if (above < 0 || resolve(above) !== i) continue; // g hangs off i
-        if (best === -1 || cust[g] > cust[best]) best = g;
-      }
-      if (best === -1) continue; // genuine small leaf feeder — keep it
-      // A near-empty trunk is not a feeder at all — always absorb it;
-      // otherwise respect the size cap.
-      if (cust[i] >= 50 && cust[i] + cust[best] > MAX_MERGED) continue;
-      mergedInto[i] = best;
-      cust[best] += cust[i]; cust[i] = 0; // keep in-pass sizes current
-      rawFeeders[best].rootNode = rawFeeders[i].rootNode; // root moves up
-      changed = true;
-    }
-    // Express merges: a feeder head too far from the sub joins the feeder
-    // that owns its trunk — but only up to the size cap. A full corridor
-    // keeps its long express honestly: that IS the second circuit a
-    // utility would string when one rural feeder can't carry the area.
-    for (let i = 0; i < rawFeeders.length; i++) {
-      if (mergedInto[i] !== -1) continue;
-      const subNode = subs[rawFeeders[i].sub].node;
-      let exLen = 0;
-      for (let w = parent[rawFeeders[i].rootNode]; w !== subNode && w !== -1; w = parent[w]) {
-        exLen += graph.edges[parentEdge[w]].len;
-      }
-      if (exLen <= MAX_EXPRESS_M) continue;
-      const pn = parent[rawFeeders[i].rootNode];
-      if (pn === -1) continue;
-      const above = feederOfNode[pn];
-      if (above < 0) continue;
-      const target = resolve(above);
-      if (target === i) continue;
-      if (cust[i] + cust[target] > MAX_MERGED) continue; // corridor is full
-      mergedInto[i] = target;
-      cust[target] += cust[i]; cust[i] = 0;
-      changed = true;
-    }
-  }
-  const finalId = new Int32Array(rawFeeders.length).fill(-1);
-  const feeders = [];
-  for (let i = 0; i < rawFeeders.length; i++) {
-    if (mergedInto[i] !== -1) continue;
-    finalId[i] = feeders.length;
-    feeders.push({
-      id: feeders.length, sub: rawFeeders[i].sub, rootNode: rawFeeders[i].rootNode,
-      nodes: [], edges: [], customers: 0,
-      lengthM: 0, ohLenM: 0, ugLenM: 0, txCount: 0,
-      expressOhKm: 0, expressUgKm: 0, expressMidM: 0,
-    });
-  }
-  for (const v of allOrder) {
-    if (feederOfNode[v] >= 0) feederOfNode[v] = finalId[resolve(feederOfNode[v])];
-  }
-  // Feeder-local subtree customer counts (final assignment). allOrder is
-  // contiguous parent-before-child per sub, so a reverse sweep works.
-  for (let i = allOrder.length - 1; i >= 0; i--) {
-    const v = allOrder[i];
-    subtreeCust[v] += custAtNode[v];
-    const p = parent[v];
-    if (p !== -1 && feederOfNode[p] === feederOfNode[v]) subtreeCust[p] += subtreeCust[v];
-  }
-  for (const f of feeders) f.customers = subtreeCust[f.rootNode];
-
-  // ---------- 6. tree edges (one per used node), OH/UG classification
+  const custAtNode = new Float64Array(nN);
+  const subtreeCust = new Float64Array(nN);
   const treeEdges = [];
   const treeEdgeOfNode = new Int32Array(nN).fill(-1);
+  const subOf = new Int32Array(nN).fill(-1);
+  const allOrder = [];
+  for (const s of subs) {
+    subOf[s.node] = s.id;
+    for (const v of subNodeOrder[s.id]) { subOf[v] = s.id; allOrder.push(v); }
+  }
   for (const v of allOrder) {
     const fid = feederOfNode[v];
     if (fid < 0) continue;
@@ -270,7 +683,7 @@ export function buildNetwork(terrain, graph, customers, towns, density, subs, rn
     const te = {
       id: treeEdges.length, node: v, parentNode: parent[v], edgeId: ei,
       feeder: fid, lenM: e.len,
-      midDistM: (dist[v] + dist[parent[v]]) / 2,
+      midDistM: built.midDistNode[v], // own-sub travel distance to midpoint
       bridge: e.bridge,
       underground: isUnderground(v, parent[v]),
     };
@@ -281,197 +694,153 @@ export function buildNetwork(terrain, graph, customers, towns, density, subs, rn
     f.nodes.push(v);
     f.lengthM += e.len;
     if (te.underground) f.ugLenM += e.len; else f.ohLenM += e.len;
+    if (f.rootNode === -1 || dist[v] < dist[f.rootNode]) f.rootNode = v;
   }
+  // Drop feeders that own no tree nodes (all their load sits at a sub
+  // busbar, or their members went unrouted) — their TXs reattach below.
+  // Ids re-compact so downstream consumers never see an edge-less feeder.
+  const fidFinal = new Int32Array(feeders.length).fill(-1);
+  feeders = feeders.filter(f => f.rootNode !== -1);
+  feeders.forEach((f, i) => { fidFinal[f.id] = i; f.id = i; });
+  for (const te of treeEdges) te.feeder = fidFinal[te.feeder];
+  for (let v = 0; v < nN; v++) if (feederOfNode[v] >= 0) feederOfNode[v] = fidFinal[feederOfNode[v]];
 
-  // ---------- 7. express runs: feeder head back to the sub busbar
+  // feeder-local subtree customers (allOrder is parent-before-child per sub)
+  let orphanTx = 0;
+  for (const tx of txs) {
+    const li = tx.node === -1 ? undefined : loadAt.get(tx.node);
+    if (li === undefined || mem.feederOf[li] === -1) { tx.feeder = -1; tx.sub = -1; orphanTx++; continue; }
+    tx.feeder = fidFinal[mem.feederOf[li]]; // -1 when the feeder was dropped
+    tx.sub = mem.feeders[mem.feederOf[li]].group;
+    custAtNode[tx.node] += tx.customers.length;
+  }
+  for (let i = allOrder.length - 1; i >= 0; i--) {
+    const v = allOrder[i];
+    subtreeCust[v] += custAtNode[v];
+    const p = parent[v];
+    if (p !== -1 && feederOfNode[p] === feederOfNode[v]) subtreeCust[p] += subtreeCust[v];
+  }
+  for (const f of feeders) f.customers = subtreeCust[f.rootNode];
+  // TXs at a sub busbar (feederOfNode = -2): attach to that sub's largest feeder
+  for (const tx of txs) {
+    if (tx.sub === -1) continue;
+    if (feederOfNode[tx.node] === -2) {
+      const best = feeders.filter(f => f.sub === subOf[tx.node])
+        .sort((a, b) => b.customers - a.customers)[0];
+      if (best) {
+        tx.feeder = best.id; tx.sub = best.sub;
+        best.customers += tx.customers.length;
+      }
+    }
+    if (tx.feeder >= 0) feeders[tx.feeder].txCount++;
+    else { tx.sub = -1; orphanTx++; }
+  }
+  // express runs: feeder head back to the sub busbar along the sub's true
+  // path — through other feeders' territory AND foreign subs' corridors
+  // (the parallel circuit on a shared road)
   for (const f of feeders) {
     const subNode = subs[f.sub].node;
+    const chain = built.subChains[f.sub];
     let ohM = 0, ugM = 0;
-    for (let w = parent[f.rootNode]; w !== subNode && w !== -1; w = parent[w]) {
-      const teId = treeEdgeOfNode[w];
-      if (teId === -1) break;
-      const te = treeEdges[teId];
-      if (te.underground) ugM += te.lenM; else ohM += te.lenM;
+    for (let w = chain.par[f.rootNode]; w !== subNode && w !== -1; w = chain.par[w]) {
+      const ei = chain.edge[w], p = chain.par[w];
+      if (ei === -1 || p === -1) break;
+      if (isUnderground(w, p)) ugM += graph.edges[ei].len; else ohM += graph.edges[ei].len;
     }
     f.expressOhKm = ohM / 1000;
     f.expressUgKm = ugM / 1000;
     f.expressMidM = (ohM + ugM) / 2;
   }
 
-  // ---------- 8. attach TXs / customers to feeders
-  for (const tx of txs) {
-    if (tx.node !== -1 && feederOfNode[tx.node] >= 0) {
-      tx.feeder = feederOfNode[tx.node];
-      feeders[tx.feeder].txCount++;
-    } else if (tx.node !== -1 && feederOfNode[tx.node] === -2) {
-      // TX exactly at a sub busbar: attach to that sub's largest feeder
-      const f = feeders.filter(f => f.sub === subOf[tx.node])
-        .sort((a, b) => b.customers - a.customers)[0];
-      tx.feeder = f ? f.id : -1;
-      if (f) { f.customers += tx.customers.length; f.txCount++; }
-    } else {
-      tx.feeder = -1;
-    }
+  // ---- membership tables + reported checks
+  const feederOfTx = new Int32Array(txs.length).fill(-1);
+  for (const tx of txs) feederOfTx[tx.id] = tx.feeder;
+  const subOfFeeder = new Int32Array(feeders.length);
+  for (const f of feeders) subOfFeeder[f.id] = f.sub;
+
+  // strict contiguity: every feeder must have exactly ONE component root
+  const rootsPerFeeder = new Int32Array(feeders.length);
+  for (const te of treeEdges) {
+    const p = te.parentNode;
+    if (feederOfNode[p] !== te.feeder) rootsPerFeeder[te.feeder]++;
   }
-  for (const tx of txs) for (const ci of tx.customers) customers[ci].tx = tx.id;
+  const multiComponent = feeders.filter(f => rootsPerFeeder[f.id] !== 1);
+  const contiguous = feeders.every(f => f.rootNode !== -1) && multiComponent.length === 0;
+  let honoured = 0, dishonoured = 0;
+  for (let li = 0; li < loadNodes.length; li++) {
+    if (mem.feederOf[li] === -1) continue;
+    const fid = fidFinal[mem.feederOf[li]];
+    if (fid === -1) continue; // dropped feeder: covered by busbar/orphan paths
+    const own = feederOfNode[loadNodes[li].node];
+    if (own === fid || own === -2) honoured++; else dishonoured++;
+  }
+  const residual = built.violations ?? [];
+  const urbanShare = classOfCust.reduce((s, v) => s + v, 0) / Math.max(1, classOfCust.length);
+  const overCap = feeders.filter(f => f.customers > capOf(f.urban) * CAP_SLACK);
+  const maxPerSub = Math.max(0, ...subs.map(s => feeders.filter(f => f.sub === s.id).length));
+  const worstTrunk = Math.max(0, ...feeders.map(f => f.trunkKm));
+  const extraChecks = [
+    {
+      name: "Membership honoured by routing",
+      pass: dishonoured === 0 && contiguous && orphanTx === 0,
+      detail: `${honoured}/${honoured + dishonoured} load nodes on their own feeder; ` +
+        (multiComponent.length
+          ? `${multiComponent.length} feeder(s) NOT contiguous (${multiComponent.map(f => "F" + f.id).join(",")}); `
+          : `every feeder a single contiguous subtree; `) +
+        `${orphanTx} orphan TX`,
+    },
+    // The remaining checks police TUNABLE rules (caps the user is invited
+    // to tune, marked tunable: true): a fail is honest reporting of an
+    // unresolved residual, not a correctness bug — the selftest gates on
+    // correctness checks only.
+    {
+      name: "Feeder caps (urban ≤ " + capOf(true) + ", rural ≤ " + capOf(false) + ")",
+      tunable: true,
+      pass: overCap.length === 0,
+      detail: overCap.length
+        ? `${overCap.length} feeder(s) over cap: ${overCap.map(f => `F${f.id}(${Math.round(f.customers)})`).join(", ")}`
+        : `${feeders.length} feeders, ${feeders.filter(f => f.urban).length} urban / ${feeders.filter(f => !f.urban).length} rural, all within cap ×${CAP_SLACK}`,
+    },
+    {
+      name: `Feeder trunks ≤ ${MAX_FEEDER_KM} km, rural extent ≤ ${RURAL_EXTENT_KM_MAX} km`,
+      tunable: true,
+      pass: !residual.some(v => v.kind === "trunk" || v.kind === "extent"),
+      detail: residual.filter(v => v.kind === "trunk" || v.kind === "extent").map(v => v.detail).join("; ") ||
+        `worst trunk ${worstTrunk.toFixed(1)} km`,
+    },
+    {
+      name: `Foreign-catchment transit ≤ ${MAX_FOREIGN_CROSSING_M} m`,
+      tunable: true,
+      pass: !residual.some(v => v.kind === "foreign"),
+      detail: residual.filter(v => v.kind === "foreign").map(v => v.detail).join("; ") || "no feeder path lingers in a foreign sub's catchment",
+    },
+    {
+      name: `Feeders per sub ≤ ${FEEDERS_PER_SUB_MAX}`,
+      tunable: true,
+      pass: maxPerSub <= FEEDERS_PER_SUB_MAX,
+      detail: `${subs.length} sub(s), max ${maxPerSub} feeders on one sub`,
+    },
+    {
+      name: `Membership repair loop (≤ ${MAX_REPAIR_PASSES} passes)`,
+      tunable: true,
+      pass: residual.length === 0,
+      detail: residual.length
+        ? `unresolved after repairs: ${residual.map(v => v.detail).join("; ")}`
+        : (repairLog.length ? repairLog.map(r => `[p${r.pass}] ${r.action}: ${r.detail}`).join(" | ") : "clean on first pass"),
+    },
+  ];
 
   return {
     txs, subs, feeders,
     dist, parent, parentEdge, subOf, feederOfNode,
     subtreeCust, custAtNode, treeEdges, treeEdgeOfNode,
     usedEdge, orphanTx,
+    membership: {
+      classOfCust, urbanShare, loadNodes: loadNodes.length,
+      feederOfTx, subOfFeeder, repairLog, residual,
+    },
+    extraChecks,
   };
-}
-
-// Zone subs = LOAD CATCHMENTS. STRICT LAYER ORDER: k-means over the
-// customer points (Lloyd, deterministic farthest-point seeding); k adapts
-// until no catchment exceeds SUB_MAX_CUST (urban split) and none that can
-// be merged sits below SUB_MIN_CUST. Each sub is placed at its catchment's
-// LOAD-WEIGHTED CENTROID, then nudged to the nearest subtransmission-
-// viable road node (on an arterial/collector corridor, low slope) —
-// never a geometric centre, never a town marker.
-export function placeSubs(terrain, graph, customers, towns) {
-  const N = customers.length;
-  const k = Math.max(1, Math.min(MAX_SUBS, Math.round(N / 2500)));
-  let clusters = lloydClusters(customers, k);
-  // Targeted fix-ups (global k bumps can ping-pong when one catchment is
-  // oversize and another undersize at the same time): split any catchment
-  // over SUB_MAX_CUST in two, merge any under SUB_MIN_CUST into its
-  // nearest neighbour. Deterministic, bounded passes.
-  for (let pass = 0; pass < 8; pass++) {
-    clusters.sort((a, b) => b.members.length - a.members.length);
-    const over = clusters.find(c => c.members.length > SUB_MAX_CUST);
-    if (over && clusters.length < MAX_SUBS) {
-      clusters = clusters.filter(c => c !== over)
-        .concat(splitCluster(customers, over));
-      continue;
-    }
-    const under = clusters.length > 1
-      ? clusters.slice().sort((a, b) => a.members.length - b.members.length)
-        .find(c => c.members.length < SUB_MIN_CUST)
-      : null;
-    if (under) {
-      let near = null, nd = Infinity;
-      for (const c of clusters) {
-        if (c === under) continue;
-        const d = Math.hypot(c.cx - under.cx, c.cy - under.cy);
-        if (d < nd) { nd = d; near = c; }
-      }
-      near.members = near.members.concat(under.members);
-      recentre(customers, near);
-      clusters = clusters.filter(c => c !== under);
-      continue;
-    }
-    break;
-  }
-  const subs = [];
-  for (const cl of clusters) {
-    cl.count = cl.members.length;
-    if (!cl.count) continue;
-    const node = nudgeToCorridor(terrain, graph, cl.cx, cl.cy, subs);
-    if (node === -1) continue;
-    let town = towns[0], bd = Infinity;
-    for (const t of towns) {
-      const d = Math.hypot(t.x - cl.cx, t.y - cl.cy);
-      if (d < bd) { bd = d; town = t; }
-    }
-    const dupes = subs.filter(s => s.baseName === town.name).length;
-    subs.push({
-      id: subs.length, node,
-      x: graph.nx[node], y: graph.ny[node],
-      centroidX: cl.cx, centroidY: cl.cy, catchment: cl.count,
-      baseName: town.name,
-      name: town.name + (dupes ? " " + "BCDEFG"[dupes - 1] : ""),
-    });
-  }
-  return subs;
-}
-
-// Deterministic Lloyd k-means over customer points (weight 1 per ICP).
-// Seeding: the overall load centroid's nearest customer, then repeated
-// farthest-point picks (no randomness → same seed, same catchments).
-function lloydClusters(customers, k) {
-  const N = customers.length;
-  let mx = 0, my = 0;
-  for (const c of customers) { mx += c.x; my += c.y; }
-  mx /= N; my /= N;
-  const cent = [];
-  let best = 0, bd = Infinity;
-  for (let i = 0; i < N; i++) {
-    const d = (customers[i].x - mx) ** 2 + (customers[i].y - my) ** 2;
-    if (d < bd) { bd = d; best = i; }
-  }
-  cent.push([customers[best].x, customers[best].y]);
-  const minD = new Float64Array(N).fill(Infinity);
-  while (cent.length < k) {
-    let far = 0, fd = -1;
-    const [lx, ly] = cent[cent.length - 1];
-    for (let i = 0; i < N; i++) {
-      const d = (customers[i].x - lx) ** 2 + (customers[i].y - ly) ** 2;
-      if (d < minD[i]) minD[i] = d;
-      if (minD[i] > fd) { fd = minD[i]; far = i; }
-    }
-    cent.push([customers[far].x, customers[far].y]);
-  }
-  const assign = new Int32Array(N);
-  for (let iter = 0; iter < 10; iter++) {
-    for (let i = 0; i < N; i++) {
-      let a = 0, ad = Infinity;
-      for (let c = 0; c < cent.length; c++) {
-        const d = (customers[i].x - cent[c][0]) ** 2 + (customers[i].y - cent[c][1]) ** 2;
-        if (d < ad) { ad = d; a = c; }
-      }
-      assign[i] = a;
-    }
-    const sx = new Float64Array(cent.length), sy = new Float64Array(cent.length);
-    const cnt = new Int32Array(cent.length);
-    for (let i = 0; i < N; i++) {
-      sx[assign[i]] += customers[i].x; sy[assign[i]] += customers[i].y; cnt[assign[i]]++;
-    }
-    for (let c = 0; c < cent.length; c++) {
-      if (cnt[c]) { cent[c][0] = sx[c] / cnt[c]; cent[c][1] = sy[c] / cnt[c]; }
-    }
-  }
-  const out = cent.map(([cx, cy]) => ({ cx, cy, members: [] }));
-  for (let i = 0; i < N; i++) out[assign[i]].members.push(i);
-  return out.filter(c => c.members.length > 0);
-}
-
-function recentre(customers, cl) {
-  let sx = 0, sy = 0;
-  for (const i of cl.members) { sx += customers[i].x; sy += customers[i].y; }
-  cl.cx = sx / cl.members.length;
-  cl.cy = sy / cl.members.length;
-}
-
-// Deterministic 2-means split of an oversize catchment.
-function splitCluster(customers, cl) {
-  const ms = cl.members;
-  // seeds: member nearest the centroid, member farthest from it
-  let a = ms[0], ad = Infinity, b = ms[0], bd = -1;
-  for (const i of ms) {
-    const d = (customers[i].x - cl.cx) ** 2 + (customers[i].y - cl.cy) ** 2;
-    if (d < ad) { ad = d; a = i; }
-    if (d > bd) { bd = d; b = i; }
-  }
-  let ca = [customers[a].x, customers[a].y], cb = [customers[b].x, customers[b].y];
-  let ga = [], gb = [];
-  for (let iter = 0; iter < 8; iter++) {
-    ga = []; gb = [];
-    for (const i of ms) {
-      const da = (customers[i].x - ca[0]) ** 2 + (customers[i].y - ca[1]) ** 2;
-      const db = (customers[i].x - cb[0]) ** 2 + (customers[i].y - cb[1]) ** 2;
-      (da <= db ? ga : gb).push(i);
-    }
-    for (const [g, c] of [[ga, ca], [gb, cb]]) {
-      if (!g.length) continue;
-      let sx = 0, sy = 0;
-      for (const i of g) { sx += customers[i].x; sy += customers[i].y; }
-      c[0] = sx / g.length; c[1] = sy / g.length;
-    }
-  }
-  const mk = (g, c) => ({ cx: c[0], cy: c[1], members: g });
-  return [mk(ga, ca), mk(gb, cb)].filter(c => c.members.length > 0);
 }
 
 // Nudge a load centroid to the nearest subtransmission-viable road node:
@@ -500,35 +869,6 @@ function nudgeToCorridor(terrain, graph, cx, cy, existingSubs) {
   const near = graph.nearestNode(cx, cy, 30000,
     (id) => !existingSubs.some(s => s.node === id));
   return near.id;
-}
-
-class NodeHeap {
-  constructor() { this.d = []; this.v = []; }
-  get size() { return this.d.length; }
-  push(d, v) {
-    const D = this.d, V = this.v; let i = D.length;
-    D.push(d); V.push(v);
-    while (i > 0) {
-      const p = (i - 1) >> 1;
-      if (D[p] <= D[i]) break;
-      [D[p], D[i]] = [D[i], D[p]]; [V[p], V[i]] = [V[i], V[p]]; i = p;
-    }
-  }
-  pop() {
-    const D = this.d, V = this.v; const top = V[0];
-    const ld = D.pop(), lv = V.pop();
-    if (D.length) {
-      D[0] = ld; V[0] = lv; let i = 0;
-      for (;;) {
-        const l = 2 * i + 1, r = l + 1; let m = i;
-        if (l < D.length && D[l] < D[m]) m = l;
-        if (r < D.length && D[r] < D[m]) m = r;
-        if (m === i) break;
-        [D[m], D[i]] = [D[i], D[m]]; [V[m], V[i]] = [V[i], V[m]]; i = m;
-      }
-    }
-    return top;
-  }
 }
 
 function clusterTransformers(customers, rng) {
@@ -585,14 +925,4 @@ function clusterTransformers(customers, rng) {
     txs.push({ id: txs.length, x: cx, y: cy, customers: members, node: -1, feeder: -1, sub: -1 });
   }
   return txs;
-}
-
-function morton(x, y) {
-  let a = Math.min(65535, Math.max(0, Math.round(x / 2)));
-  let b = Math.min(65535, Math.max(0, Math.round(y / 2)));
-  let m = 0;
-  for (let i = 0; i < 16; i++) {
-    m += ((a >> i) & 1) * Math.pow(2, 2 * i) + ((b >> i) & 1) * Math.pow(2, 2 * i + 1);
-  }
-  return m;
 }
