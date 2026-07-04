@@ -19,10 +19,10 @@ python -m http.server 8317
 
 Optional URL modes:
 - `?selftest=1` — headless self-test: generates three seeds at the fixed
-  25 000 customers, runs every correctness check (18-sub count asserted),
-  greedy placement of both device kinds (monotonicity asserted), the
-  debug rate experiment, and fault-conservation checks, and prints a JSON
-  report into the page.
+  25 000 customers, runs every correctness check (emergent sub/feeder
+  counts sanity-banded), greedy placement of both device kinds
+  (monotonicity asserted), the debug rate experiment, and
+  fault-conservation checks, and prints a JSON report into the page.
 - `?demo=1` — regenerates, places 8 sectionalisers + 4 reclosers, and
   freezes a fault mid-timeline (handy for screenshots).
 - `?scaletest=1` — one seed at 8k→64k customers with timing + checks.
@@ -36,15 +36,16 @@ dominates). Feeder counts scale with load (≈ customers/100 under the
 default caps). Past ~32k the `MAX_SUBS = 24` backstop clamps sub count,
 so the tunable feeders-per-sub rule reports honest residuals at scale.
 The UI is fixed at 25,000 customers; other sizes work programmatically
-via `generate()` / `?scaletest=1` (the 18-sub count stays fixed, so very
-large worlds report feeders-per-sub residuals).
+via `generate()` / `?scaletest=1` (sub and feeder counts scale with load
+since both emerge from the rule caps).
 
 ## Pipeline — strict dependency order (seeded/deterministic)
 
 Layers are produced in order, each consuming only earlier layers:
-**terrain → settlements → roads → load → membership (customers → feeders →
-subs, before any routing) → sub siting → feeder routing → subtransmission
-(visual only)**, wrapped in a validation pass (below).
+**terrain → settlements → roads → load → transformers → zone subs (grown,
+sited, capacity-balanced) → feeder cuts → subtransmission (visual only)**,
+wrapped in a validation pass (below). Sub and feeder counts EMERGE from
+simple rule caps — no fixed counts, no minimums.
 
 1. **Terrain** ([js/terrain.js](js/terrain.js)) — fBm elevation + ramp puts
    the sea along one seed-chosen edge; one river is traced from the far map
@@ -71,38 +72,31 @@ subs, before any routing) → sub siting → feeder routing → subtransmission
    sizes rank-ordered) + rural background decaying with ROAD distance, so
    sparse rural load hugs the roads; **25 000 customers (fixed in the
    UI)** sampled on buildable land, snapped to the road graph.
-5. **Membership** ([js/membership.js](js/membership.js)) — decided BEFORE
-   any routing. Customers classified urban/rural by local density
-   (`URBAN_CUST_PER_KM2 = 60` within 500 m — absolute, so a denser world
-   classifies more urban). Customers (as TX load nodes, ≤ 50 cust/TX) →
-   feeders by **road-graph-capacitated clustering** (urban ≤ `N_URBAN_MAX
-   = 700`; rural ≤ `N_RURAL_MAX = 300` plus a `RURAL_EXTENT_KM_MAX = 10`
-   road-radius cap; growth fills to the cap by skipping oversize nodes,
-   and runts < 150 fold into their road-nearest neighbour — targeting
-   **~80–120 feeders** at the fixed 25 000 customers). Feeders →
-   **exactly `N_SUBS = 18` zone subs (fixed)** by grouping
-   **road-adjacent** feeders (shared road-graph Voronoi boundary, not
-   straight-line proximity); grouping is forced to the count and every
-   repair is count-preserving, with `FEEDERS_PER_SUB_MAX = 8` as the
-   tunable per-sub ceiling.
-6. **Sub siting** ([js/network.js](js/network.js)) — each zone sub sits at
-   the **load-weighted centroid of its feeder group**, nudged to the
-   nearest subtransmission-viable road node (arterial/collector corridor,
-   gentle slope) — never a geometric centre, never a town marker.
-7. **Feeder routing** ([js/network.js](js/network.js)) — LAST, honouring
-   membership: one Dijkstra tree per sub over the roads, serving ONLY that
-   sub's members; trees may not overlap (one circuit per road corridor).
-   A sub only claims road nodes inside its own catchment; a path's
-   stretches through a foreign catchment are charged as EXPRESS exposure
-   (the second circuit strung along a shared road — bridges especially).
-   Every feeder ends up a contiguous subtree with a single root (enforced,
-   logged); express runs back to the sub are charged as un-switchable base
-   SAIDI. A bounded **validate + repair loop** (`MAX_REPAIR_PASSES = 3`)
-   re-splits / re-groups affected members when a feeder trunk exceeds
-   `MAX_FEEDER_KM = 20`, a path rides another sub's actual network beyond
-   `MAX_FOREIGN_CROSSING_M = 2500`, or any cap is breached — outcomes
-   reported in the Checks panel. Sections in high-density cells are
-   underground cable (drawn dashed), the rest overhead.
+5. **Transformers** ([js/network.js](js/network.js)) — the TX sits AT a
+   seed customer (a fixed pole site) and gathers neighbours within
+   `TX_MAX_M = 500` m, up to `TX_MAX_CUST = 100` — so the 500 m rule holds
+   **exactly by construction**. Rural TXs max out on distance, urban on
+   count (≈ 1,050–1,320 TXs at 25 000 customers).
+6. **Zone subs** ([js/network.js](js/network.js), [js/membership.js](js/membership.js)) —
+   TXs cluster by road-Dijkstra growth (`SUB_MAX_KM = 25` by road or
+   `SUB_MAX_CUST = 2000`, no minimums); each sub is sited at its cluster's
+   **load-weighted centroid**, nudged to the nearest subtransmission-viable
+   road node. Every TX then joins its road-nearest sub via an
+   **additively weighted graph Voronoi**: one multi-source Dijkstra whose
+   sources start at a per-sub offset λ, so the shortest-path forest is
+   DISJOINT per sub by construction; over-cap subs bid their boundary out,
+   starved subs bid back in, and a cell that stays over cap **spawns a new
+   sub** in its far half — the sub count truly emerges (measured 15–19).
+7. **Feeder cuts** ([js/network.js](js/network.js)) — each sub's
+   shortest-path road tree is partitioned into contiguous subtrees cut to
+   `FEEDER_MAX_CUST = 500` customers and `FEEDER_MAX_KM = 25` circuit
+   length (owned + trunk run), relaxed to `FEEDER_LONG_KM = 40` while
+   under `FEEDER_LONG_CUST = 50` — a remote valley rides one long skinny
+   feeder instead of becoming a micro-sub. Feeder heads reach the sub by
+   an express run (the parallel circuit along a shared trunk), charged as
+   un-switchable base SAIDI. Measured 75–85 feeders at 25 000 customers.
+   Sections in high-density cells are underground cable (drawn dashed),
+   the rest overhead.
 8. **Subtransmission** ([js/subtx.js](js/subtx.js)) — GXP on a flat
    map-edge cell near the load centroid; least-cost A* lines GXP → each
    sub (slope penalised, ocean blocked, river crossings 6×, road corridors
@@ -126,26 +120,26 @@ MIN_ZIPF_RATIO        = 2.2  // realised largest/median town size too flat
                              // (the peri-urban kernel spreads big-town mass)
 ```
 
-### Membership caps ([js/membership.js](js/membership.js), [js/network.js](js/network.js) — all tunable)
+### Rule caps ([js/membership.js](js/membership.js) — all tunable, no minimums)
 
 ```
-N_SUBS                  = 18    // zone-sub count — FIXED (grouping forced to it)
-URBAN_CUST_PER_KM2      = 60    // urban ⇔ ≥ this many customers within 500 m
-N_URBAN_MAX             = 700   // customer cap, urban feeder
-N_RURAL_MAX             = 300   // customer cap, rural feeder
-RURAL_EXTENT_KM_MAX     = 10    // rural feeder growth radius by road (span ≤ 2×)
-FEEDERS_PER_SUB_MAX     = 8     // feeder-count cap per zone sub
-URBAN_EXTENT_KM_MAX     = 6     // urban feeder growth radius (compactness guard)
-GROUP_SPREAD_KM_MAX     = 16    // max bbox diagonal of one sub's feeder group
-MAX_FEEDER_KM           = 20    // trunk: sub → farthest member by road
-MAX_FOREIGN_CROSSING_M  = 2500  // transit on another sub's actual network
-MAX_REPAIR_PASSES       = 3     // bounded validate/repair loop
+TX_MAX_CUST      = 100   // customers per distribution transformer
+TX_MAX_M         = 500   // customer → transformer distance (m) — exact
+SUB_MAX_CUST     = 2000  // customers per zone sub
+SUB_MAX_KM       = 25    // transformer → zone sub, by road
+FEEDER_MAX_CUST  = 500   // customers per feeder (uniform)
+FEEDER_MAX_KM    = 25    // feeder circuit length (owned + trunk run)
+FEEDER_LONG_KM   = 40    // long-feeder allowance…
+FEEDER_LONG_CUST = 50    // …while carrying fewer than this
 ```
 
-Rule checks in the Checks panel marked by these caps are **tunable**: a
-residual after the bounded repair loop is honest reporting for you to
-tune, and does not gate the selftest — correctness checks (conservation,
-contiguity, membership honoured, monotonicity, fault conservation) do.
+Rules are enforced by construction wherever possible; the residue (sub
+totals drifting past the cap at weighted-Voronoi boundaries, realised
+distances after siting, irreducible single-node overshoots) is CHECKED
+and reported in the Checks panel as **tunable** entries that do not gate
+the selftest — correctness checks (conservation, every-TX-mapped,
+monotonicity, fault conservation) do. Measured on the test seeds: zero
+rule violations.
 
 9. **Reliability** ([js/reliability.js](js/reliability.js)) — per-feeder
    SAIDI with separate overhead/underground fault rates (defaults 0.08 /
@@ -199,8 +193,9 @@ contiguity, membership honoured, monotonicity, fault conservation) do.
   (flat map-edge cell near the load centroid) to each zone sub. VISUAL
   ONLY: a correctness check asserts SAIDI and network structure are
   identical with and without it.
-- Seed input, town/inland sliders (customers fixed at 25 000, zone subs
-  fixed at 18), eleven layer toggles, click-a-feeder stats, pan/zoom.
+- Seed input, town/inland sliders (customers fixed at 25 000; sub and
+  feeder counts emerge from the rule caps), eleven layer toggles,
+  click-a-feeder stats, pan/zoom.
 
 ## Correctness guards (asserted and reported in the Checks panel)
 

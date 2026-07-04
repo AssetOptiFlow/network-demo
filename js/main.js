@@ -311,12 +311,11 @@ function selftest() {
       membership: {
         urbanSharePct: Math.round(net.membership.urbanShare * 100),
         loadNodes: net.membership.loadNodes,
-        urbanFeeders: net.feeders.filter(f => f.urban).length,
-        ruralFeeders: net.feeders.filter(f => !f.urban).length,
-        worstTrunkKm: +Math.max(0, ...net.feeders.map(f => f.trunkKm ?? 0)).toFixed(1),
+        worstTxSubKm: net.membership.worstTxSubKm,
+        worstCircuitKm: net.membership.worstCircuitKm,
+        reassigned: net.membership.reassigned,
         maxFeedersPerSub: Math.max(0, ...net.subs.map(s => net.feeders.filter(f => f.sub === s.id).length)),
-        repairLog: net.membership.repairLog.map(r => `[p${r.pass}] ${r.action}: ${r.detail}`),
-        residual: net.membership.residual.map(v => v.detail),
+        ruleViolations: net.membership.ruleViolations,
       },
       txs: net.txs.length,
       roadNodes: world.graph.nNodes,
@@ -369,12 +368,12 @@ function selftest() {
   const allPass = results.every(r =>
     r.checks.every(c => c.pass || c.tunable) && r.greedyMonotone && r.recloserMonotone &&
     r.faultConservation && r.validationPass &&
-    // degeneracy bands: target ≈ 80–120 feeders at the fixed 25k world
-    // (fill-to-cap growth + runt folding); the gates are set wider so a
-    // seed slightly outside the ideal band reports rather than fails
-    r.feeders >= 80 && r.feeders <= 150 &&
+    // degeneracy bands: sub and feeder counts EMERGE from the rule caps
+    // (measured ≈ 13–15 subs, 60–80 feeders at 25k customers)
+    r.subs >= 8 && r.subs <= 25 &&
+    r.feeders >= 45 && r.feeders <= 110 &&
     r.meanCustPerFeeder >= 120 && r.meanCustPerFeeder <= 800 &&
-    r.gxp !== null && r.subs === 18 && // sub count is FIXED
+    r.gxp !== null &&
     r.drTargets.sw.counts[0] !== null && r.drTargets.rc.counts[0] !== null &&
     r.totalMs < 5000 && (!r.debugSupported || r.debugRateWeighted === true)) &&
     inlandTest.checksPass && inlandTest.townsMoved;
@@ -435,7 +434,7 @@ function scaletest() {
       roadNodes: world.graph.nNodes,
       snapMeanM: Math.round(world.snapStats.mean),
       monotone: checkMonotone(greedy.log).pass && checkMonotone(greedyRc.log).pass,
-      maxTxLoadShare: +(Math.max(...world.net.txs.map(t => t.customers.length)) / 50).toFixed(2),
+      maxTxLoadShare: +(Math.max(...world.net.txs.map(t => t.customers.length)) / 100).toFixed(2),
     });
   }
   const pre = document.getElementById("selftest-out");
