@@ -14,6 +14,13 @@
 //  - Rural roads: spurs off arterials into flat country every ~1–1.6 km
 //    (many fork), then nearby dead ends are LINKED into a sparse web of
 //    back roads, so the countryside reads as through-routes, not stubs.
+//  - Cross-country connectors: where two rural points are close as the
+//    crow flies but far by road (the "drive via the town" detour) AND the
+//    land between routes almost straight, a sealed collector is built.
+//    The route-cost gate self-limits this to easy country: plains knit
+//    into a mesh, while ranges and the river keep funnelling traffic
+//    through the towns (a NEW bridge costs 28x so the gate rejects it;
+//    existing bridges at 1.3x may be reused).
 //  - Line easements (CLS_EASEMENT) are NOT roads: straight cross-country
 //    power spans added by the network layer for remote transformers. They
 //    are excluded from road drawing and from the bridges-only river rule.
@@ -198,7 +205,11 @@ export class GridRouter {
     if (t.water[i] === 0 && !t.mainland[i]) return -1;       // stranded pocket
     return t.slopeCostMul(i);
   }
-  route(x0, y0, x1, y1) {
+  // maxCost (optional) prunes the search: since the heuristic never
+  // overestimates, any node whose f exceeds maxCost cannot lie on a route
+  // cheaper than maxCost — callers that will reject expensive routes
+  // anyway (the cross-connector cost gate) avoid flooding the map first.
+  route(x0, y0, x1, y1, maxCost = Infinity) {
     const t = this.t, nx = GRID_NX, ny = GRID_NY;
     const [sx, sy] = t.cellOf(x0, y0);
     const [tx, ty] = t.cellOf(x1, y1);
@@ -226,16 +237,18 @@ export class GridRouter {
           const step = CELL * (dx && dy ? Math.SQRT2 : 1) * mul;
           const ng = g[cur] + step;
           if (stamp[ni] !== this.gen || ng < g[ni]) {
+            const h = Math.hypot((ax - tx), (ay - ty)) * CELL;
+            if (ng + h > maxCost) continue;
             stamp[ni] = this.gen;
             g[ni] = ng;
             came[ni] = cur;
-            const h = Math.hypot((ax - tx), (ay - ty)) * CELL;
             heap.push(ng + h, ni);
           }
         }
       }
     }
     if (stamp[goal] !== this.gen) return null;
+    this.lastCost = g[goal]; // terrain-weighted cost of the found route
     const cells = [];
     for (let c = goal; c !== -1; c = came[c]) {
       cells.push(c);
@@ -347,7 +360,7 @@ export function buildRoads(terrain, towns, corridors, rng) {
       routeLink(bi, bj);
     }
     // …then k-NEAREST links add loops: every town and settlement also
-    // routes to its 2 nearest neighbours (within 45 km), so the inter-town
+    // routes to its 3 nearest neighbours (within 45 km), so the inter-town
     // network is a web with alternative routes, not a bare tree.
     for (let i = 0; i < m; i++) {
       const near = [];
@@ -356,7 +369,7 @@ export function buildRoads(terrain, towns, corridors, rng) {
         near.push({ j, d: Math.hypot(towns[j].x - towns[i].x, towns[j].y - towns[i].y) });
       }
       near.sort((a, b) => a.d - b.d);
-      for (const { j, d } of near.slice(0, 2)) {
+      for (const { j, d } of near.slice(0, 3)) {
         if (d < 45000) routeLink(i, j);
       }
     }
@@ -451,28 +464,141 @@ export function buildRoads(terrain, towns, corridors, rng) {
 
   // ---- 3b. Rural web: join nearby dead ends into through routes, so the
   // back country reads as a sparse road web rather than a comb of stubs.
-  // Straight-line river hits are skipped — country lanes don't casually
-  // build bridges (arterials still do, at 28x).
+  // Up to TWO links per end (the second heading the opposite way, turning
+  // some junctions into crossroads). Straight-line river hits are skipped
+  // — country lanes don't casually build bridges (arterials still do,
+  // at 28x).
+  let webLinks = 0;
   for (let i = 0; i < linkEnds.length; i++) {
-    if (rSpur.float() > 0.55) continue;
+    if (rSpur.float() > 0.8) continue;
     const [ax, ay] = linkEnds[i];
-    let bj = -1, bd = Infinity;
-    for (let j = 0; j < linkEnds.length; j++) {
-      if (j === i) continue;
-      const d = Math.hypot(linkEnds[j][0] - ax, linkEnds[j][1] - ay);
-      if (d > 800 && d < bd) { bd = d; bj = j; } // >800 m: skip trivial stubs
+    const pick = (awayX, awayY) => {
+      let bj = -1, bd = Infinity;
+      for (let j = 0; j < linkEnds.length; j++) {
+        if (j === i) continue;
+        const dx = linkEnds[j][0] - ax, dy = linkEnds[j][1] - ay;
+        const d = Math.hypot(dx, dy);
+        if (d <= 800 || d > 8000 || d >= bd) continue; // >800 m: skip trivial stubs
+        if (awayX !== undefined && dx * awayX + dy * awayY > 0) continue;
+        bd = d; bj = j;
+      }
+      return bj;
+    };
+    const targets = [];
+    const first = pick();
+    if (first !== -1) {
+      targets.push(first);
+      // second link into the opposite half-plane makes a through-route
+      if (rSpur.float() < 0.45) {
+        const second = pick(linkEnds[first][0] - ax, linkEnds[first][1] - ay);
+        if (second !== -1) targets.push(second);
+      }
     }
-    if (bj === -1 || bd > 6500) continue;
-    const [bx, by] = linkEnds[bj];
-    if (terrain.segmentTouchesRiver(ax, ay, bx, by)) continue;
-    const cellsLink = router.route(ax, ay, bx, by);
-    if (cellsLink) addRoutedPath(cellsLink, CLS_LOCAL);
+    for (const bj of targets) {
+      const [bx, by] = linkEnds[bj];
+      if (terrain.segmentTouchesRiver(ax, ay, bx, by)) continue;
+      const cellsLink = router.route(ax, ay, bx, by);
+      if (cellsLink) { addRoutedPath(cellsLink, CLS_LOCAL); webLinks++; }
+    }
+  }
+
+  // ---- 3c. Cross-country connectors: for pairs of rural points that are
+  // close as the crow flies but far (or unreachable) by road — the "drive
+  // via the town" detour — build the sealed collector that history would
+  // have built, IF the land between routes almost straight. Deterministic:
+  // no RNG here, candidates and gates derive from the built graph alone.
+  const DETOUR_MIN = 3.5;  // build only if road distance > 3.5x straight…
+  const COST_MAX = 1.45;   // …and A* route cost < 1.45x straight (flat land;
+                           // a NEW bridge at 28x can never pass this gate)
+  const CROSS_D_MIN = 1800, CROSS_D_MAX = 7500;
+  const cand = [];
+  const candIds = new Set();
+  const addCand = (x, y) => {
+    const near = graph.nearestNode(x, y, 400);
+    if (near.id === -1 || candIds.has(near.id)) return;
+    candIds.add(near.id);
+    cand.push({ id: near.id, x: graph.nx[near.id], y: graph.ny[near.id] });
+  };
+  for (const cells of arterialCellPaths) {
+    let acc = 0;
+    for (let i = 1; i < cells.length; i++) {
+      acc += CELL;
+      if (acc < 2400) continue;
+      acc = 0;
+      const [px, py] = terrain.cellCentre(cells[i] % n, (cells[i] / n) | 0);
+      addCand(px, py);
+    }
+  }
+  for (const [ex, ey] of linkEnds) addCand(ex, ey);
+  // each candidate proposes to its 2 nearest partners in range; pairs are
+  // tried shortest-first so the cheapest missing links are built first and
+  // road distance — re-measured per pair on the graph as built so far —
+  // de-justifies the longer, now-redundant ones
+  const pairs = new Map();
+  for (let i = 0; i < cand.length; i++) {
+    const near = [];
+    for (let j = 0; j < cand.length; j++) {
+      if (j === i) continue;
+      const d = Math.hypot(cand[j].x - cand[i].x, cand[j].y - cand[i].y);
+      if (d > CROSS_D_MIN && d < CROSS_D_MAX) near.push({ j, d });
+    }
+    near.sort((p, q) => p.d - q.d);
+    for (const { j, d } of near.slice(0, 2)) {
+      const key = i < j ? i * 65536 + j : j * 65536 + i;
+      if (!pairs.has(key)) pairs.set(key, { a: cand[i], b: cand[j], d });
+    }
+  }
+  let crossLinks = 0;
+  for (const { a, b, d } of [...pairs.values()].sort((p, q) => p.d - q.d)) {
+    // river-straddling pairs are never productive: a NEW bridge can't pass
+    // the cost gate, and where an existing bridge carries a road the pair
+    // is already road-connected — so skip before the expensive searches
+    if (terrain.segmentTouchesRiver(a.x, a.y, b.x, b.y)) continue;
+    if (graphDistance(graph, a.id, b.id, DETOUR_MIN * d) !== Infinity) continue;
+    const cells = router.route(a.x, a.y, b.x, b.y, COST_MAX * d);
+    if (!cells || router.lastCost > COST_MAX * d) continue;
+    const ends = addRoutedPath(cells, CLS_COLLECTOR);
+    if (!ends) continue;
+    // stitch both ends onto the existing graph, bridge-flagged exactly
+    graph.addEdge(a.id, ends.first, CLS_COLLECTOR, terrain.segmentTouchesRiver(
+      graph.nx[a.id], graph.ny[a.id], graph.nx[ends.first], graph.ny[ends.first]));
+    graph.addEdge(ends.last, b.id, CLS_COLLECTOR, terrain.segmentTouchesRiver(
+      graph.nx[ends.last], graph.ny[ends.last], graph.nx[b.id], graph.ny[b.id]));
+    crossLinks++;
   }
 
   // ---- 4. Connectivity repair (assert-backed, not assumed)
   const repair = repairConnectivity(graph, terrain, router);
 
-  return { graph, repair };
+  return { graph, repair, stats: { webLinks, crossLinks } };
+}
+
+// Dijkstra over the road graph, early-exit at maxD — the detour test for
+// cross-country connectors ("how far is it by road today?").
+function graphDistance(graph, a, b, maxD) {
+  if (a === b) return 0;
+  const dist = new Map([[a, 0]]);
+  const done = new Set();
+  const heap = new MinHeap();
+  heap.push(0, a);
+  while (heap.size) {
+    const v = heap.pop();
+    if (done.has(v)) continue;
+    done.add(v);
+    const dv = dist.get(v);
+    if (v === b) return dv;
+    if (dv > maxD) return Infinity;
+    for (const ei of graph.adj[v]) {
+      const e = graph.edges[ei];
+      const w = e.a === v ? e.b : e.a;
+      const nd = dv + e.len;
+      if (nd <= maxD && nd < (dist.get(w) ?? Infinity)) {
+        dist.set(w, nd);
+        heap.push(nd, w);
+      }
+    }
+  }
+  return Infinity;
 }
 
 // Local grid axis for a town: coastline tangent when the sea is close,

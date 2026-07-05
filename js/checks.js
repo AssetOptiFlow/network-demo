@@ -16,6 +16,8 @@ export function runChecks(world) {
   const { nComp } = components(graph);
   add("Road graph fully connected", nComp === 1,
     `${nComp} component(s), ${graph.nNodes} nodes, ${graph.edges.length} edges` +
+    (world.roadStats ? `, ${world.roadStats.webLinks} rural web link(s), ` +
+      `${world.roadStats.crossLinks} cross-country connector(s)` : "") +
     (world.roadRepair ? `, ${world.roadRepair.merges} repair merge(s)` : ""));
 
   // 2. every customer served by exactly one feeder

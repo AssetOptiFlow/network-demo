@@ -55,7 +55,7 @@ function generateOnce(params) {
   mark("settlements", t);
 
   t = performance.now();
-  const { graph, repair } = buildRoads(terrain, towns, corridors, rng.fork("roads"));
+  const { graph, repair, stats: roadStats } = buildRoads(terrain, towns, corridors, rng.fork("roads"));
   const roadDistM = roadDistanceGrid(terrain, graph);
   mark("roads", t);
 
@@ -105,7 +105,7 @@ function generateOnce(params) {
 
   const world = {
     params, terrain, towns, corridors, density, customers, graph, net, subtx,
-    roadRepair: repair, snapStats, roadDistM,
+    roadRepair: repair, roadStats, snapStats, roadDistM,
   };
   t = performance.now();
   world.prune = prune;
