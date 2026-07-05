@@ -231,6 +231,20 @@ export class Renderer {
         const te = net.treeEdges[teId];
         const over = this._edgeClassDuringPlayback(teId, f.id);
         ctx.strokeStyle = over ?? base;
+        if (te.lead) {
+          // unloaded exit lead: a parallel circuit along the shared
+          // corridor, drawn thin and dotted along its actual road path
+          ctx.lineWidth = (sel ? lw * 1.2 : lw * 0.7);
+          ctx.setLineDash([2, 6]);
+          ctx.beginPath();
+          ctx.moveTo(this.sx(g.nx[te.path[0]]), this.sy(g.ny[te.path[0]]));
+          for (let i = 1; i < te.path.length; i++) {
+            ctx.lineTo(this.sx(g.nx[te.path[i]]), this.sy(g.ny[te.path[i]]));
+          }
+          ctx.stroke();
+          ctx.setLineDash([]);
+          continue;
+        }
         ctx.lineWidth = (sel ? lw * 1.7 : lw) * (over && over.startsWith("rgba") ? 0.8 : 1);
         ctx.setLineDash(this.debugBranch && this.debugBranch.has(teId) ? [7, 5]
           : te.underground ? [3, 3] : []);
@@ -497,13 +511,26 @@ export class Renderer {
     if (!world) return -1;
     const g = world.graph, net = world.net;
     let best = -1, bestD = tolPx;
-    for (const te of net.treeEdges) {
-      const ax = this.sx(g.nx[te.parentNode]), ay = this.sy(g.ny[te.parentNode]);
-      const bx = this.sx(g.nx[te.node]), by = this.sy(g.ny[te.node]);
+    const segDist = (ax, ay, bx, by) => {
       const dx = bx - ax, dy = by - ay;
       const len2 = dx * dx + dy * dy || 1;
       const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
-      const d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+      return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+    };
+    for (const te of net.treeEdges) {
+      let d;
+      if (te.lead) {
+        // leads follow their road path, not the straight chord
+        d = Infinity;
+        for (let i = 1; i < te.path.length; i++) {
+          d = Math.min(d, segDist(
+            this.sx(g.nx[te.path[i - 1]]), this.sy(g.ny[te.path[i - 1]]),
+            this.sx(g.nx[te.path[i]]), this.sy(g.ny[te.path[i]])));
+        }
+      } else {
+        d = segDist(this.sx(g.nx[te.parentNode]), this.sy(g.ny[te.parentNode]),
+          this.sx(g.nx[te.node]), this.sy(g.ny[te.node]));
+      }
       if (d < bestD) { bestD = d; best = te.id; }
     }
     return best;

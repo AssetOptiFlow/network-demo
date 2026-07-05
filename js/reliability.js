@@ -27,10 +27,20 @@
 //    labelled simplifications.
 //  - One device per section. The stretch between the fault and the nearest
 //    isolators (up- and downstream) still waits out the full repair.
-//  - NO express runs: every feeder roots AT its sub busbar (network.js
-//    spawns extra subs rather than running parallel circuits), so there is
-//    no un-switchable express floor in SAIDI.
-//  - Device-free baseline: one breaker at the sub, no fuses.
+//  - LATERAL FUSES are STANDARD CONSTRUCTION, part of the baseline like
+//    crossarms: every section whose downstream subtree carries at most
+//    LATERAL_FUSE_MAX_CUST customers is fuse-protected — a fault there
+//    interrupts only that subtree (travel + repair) and nobody else.
+//    Deepest fuse wins (ideal coordination); fuse replacement time is
+//    folded into the flat repair. Devices on fused laterals gain nothing,
+//    so the greedy correctly spends its budget on trunks.
+//  - SIBLING/EXPRESS feeders (network.js) enter as an unloaded exit LEAD —
+//    one virtual first section. A lead fault interrupts the whole feeder;
+//    parallel circuits on the same corridor fault INDEPENDENTLY
+//    (common-mode shared-structure events not modelled — labelled).
+//  - Device-free baseline: one breaker per feeder position + standard
+//    lateral fusing, no automation. That is the counterfactual a real
+//    planner reasons from — no utility operates fuseless.
 //
 // Device model per fault on edge e (evaluated EXACTLY, per feeder):
 //   zone  = subtree of the deepest recloser on path(root → e), else feeder
@@ -50,6 +60,11 @@
 export const REPAIR_MIN = 120;
 export const TRAVEL_KMH = 50;
 export const SWITCH_MIN = 45;
+// Sections with at most this many downstream customers are fuse-protected
+// as standard construction (part of the device-free baseline). Calibrated
+// so the fused-but-unautomated baseline lands in the 150–500 min/yr
+// planning band (30 ≈ one TX group / small spur, not whole TX clusters).
+export const LATERAL_FUSE_MAX_CUST = 30;
 
 export const faultRates = { oh: 0.08, ug: 0.02 }; // faults / km / yr
 
@@ -147,6 +162,19 @@ function feederCustMin(net, f, devices, rateMul = null, extraTe = -1, extraKind 
   while (stack.length) {
     const [teId, NZin, NWin, Ain] = stack.pop();
     const te = net.treeEdges[teId];
+    const nBelow = net.subtreeCust[te.node];
+    if (nBelow <= LATERAL_FUSE_MAX_CUST) {
+      // FUSED LATERAL (standard construction, deepest fuse wins): a fault
+      // on this section drops only its own subtree for travel + repair —
+      // the rest of the feeder rides through. Devices in here change
+      // nothing, so trial gains on fused sections are exactly zero.
+      custMin += edgeMass(te, rateMul) * faultDurMin(te) * nBelow;
+      const fkids = children.get(te.node);
+      if (fkids) for (const k of fkids) {
+        if (net.treeEdges[k].feeder === f.id) stack.push([k, NZin, NWin, Ain]);
+      }
+      continue;
+    }
     let NZ = NZin, NW = NWin, A = Ain;
     if (isRc(teId)) { NZ = NW = net.subtreeCust[te.node]; A = 0; }
     else if (isSw(teId)) { NW = net.subtreeCust[te.node]; A = 0; }
@@ -356,6 +384,25 @@ export function faultScenario(net, devices, teId) {
   const children = net._children ?? (net._children = feederStructure(net));
   const te = net.treeEdges[teId];
   const f = net.feeders.find(f => f.id === te.feeder);
+  // FUSED LATERAL: the fuse clears the fault — only this subtree goes out,
+  // for travel + repair; no switching phase, the feeder rides through.
+  const nBelow = net.subtreeCust[te.node];
+  if (nBelow <= LATERAL_FUSE_MAX_CUST) {
+    const outE = subtreeEdges(net, teId);
+    const tTravel = travelMin(te.midDistM);
+    return {
+      teId, feeder: f.id, faultEdge: te, fused: true,
+      switchEdge: -1, recloserEdge: -1,
+      zoneEdges: outE, outEdges: new Set(outE), tieEdges: new Set(),
+      custOut: nBelow, custIso: 0, custTie: 0,
+      custUnaffected: f.customers - nBelow,
+      custAffected: nBelow,
+      conservationOk: true,
+      tSwitch: null,
+      tTravel,
+      tRepairDone: tTravel + REPAIR_MIN,
+    };
+  }
   let switchTe = -1, recloserTe = -1;
   for (let cur = teId; cur !== -1; cur = parentTreeEdge(net, cur)) {
     if (net.treeEdges[cur].feeder !== f.id) break; // crossed onto the trunk circuit

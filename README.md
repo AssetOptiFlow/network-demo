@@ -32,12 +32,14 @@ Optional URL modes:
 
 Measured (Windows, headless Edge, 100 × 70 km map): all **correctness**
 checks pass and greedy stays monotone up to at least **64,000 customers**
-(regen ≈ 0.6–4.7 s across 8k–64k; the fixed 50k UI world regenerates in
-≈ 3–11 s depending on seed, including the prune rebuilds). The UI samples
-a fixed 50,000 customers; other sizes work programmatically via
-`generate()` / `?scaletest=1` (settlement targets are SHARES of the
-sampled count, so the hierarchy scales with it — measured 89 feeders at
-8k up to 212 at 64k, after pruning).
+(regen ≈ 0.8–6.8 s across 8k–64k; the fixed 50k UI world regenerates in
+≈ 3–11 s depending on seed, including the prune rebuilds and parsimony
+trials). The UI samples a fixed 50,000 customers; other sizes work
+programmatically via `generate()` / `?scaletest=1` (settlement targets
+are SHARES of the sampled count, so the hierarchy scales with it —
+measured 29 feeders at 8k up to 143 at 64k, after pruning; off-design
+sizes may report tunable residuals such as under-minimum rural stations
+parsimony cannot lawfully dissolve).
 
 ## Pipeline — strict dependency order (seeded/deterministic)
 
@@ -100,34 +102,45 @@ simple rule caps — no fixed counts, no minimums.
    road rule.
 6. **Zone subs** ([js/network.js](js/network.js), [js/membership.js](js/membership.js)) —
    TXs cluster by road-Dijkstra growth (`SUB_MAX_KM = 50` by road or
-   `SUB_MAX_CUST = 4000`, no minimums); each sub is sited at its cluster's
+   `SUB_MAX_CUST = 5000`); each initial sub is sited at its cluster's
    **load-weighted centroid**, nudged to the nearest subtransmission-viable
-   road node. Every TX then joins its road-nearest sub via an
+   road node; ladder-spawned subs sit **at a load-weighted median node on
+   their own corridor** (so the re-bid is guaranteed to hand them their
+   neighbourhood). Every TX joins its road-nearest sub via an
    **additively weighted graph Voronoi**: one multi-source Dijkstra whose
    sources start at a per-sub offset λ, so the shortest-path forest is
    DISJOINT per sub by construction; over-cap subs bid their boundary out,
-   starved subs bid back in, and a cell that stays over cap **spawns a new
-   sub** in its far half; a busbar branch that overflows the feeder caps
-   spawns one too, and stations that end up within 6 km of each other are
-   MERGED when their combined load fits a couple of feeders — the sub
-   count truly emerges (measured ≈ 35 on the 100 × 70 km map at 50k customers).
-7. **Feeders + prune** ([js/network.js](js/network.js),
-   [js/main.js](js/main.js)) — feeders are the BUSBAR BRANCHES of each
-   sub's shortest-path tree, one per branch: **no deep cuts and no
-   express runs** (no parallel circuits sharing a trunk). A branch that
-   would overflow `FEEDER_MAX_CUST = 1000` customers or reach farther
-   than `FEEDER_MAX_KM = 50` (line distance sub → farthest point; total
-   conductor is unbounded, like real rural feeders) instead spawns a new
-   sub at the branch's far-half load centroid during the assignment loop
-   — so stations sit central to the feeders they serve. Residual
-   violations (a dense-town road carrying > 1000 on one branch) are
-   reported, never hidden. A feeder still carrying fewer than
-   `FEEDER_MIN_CUST = 20` customers is PRUNED — the feeder, its
-   transformers AND its customers are removed (uneconomic to reticulate)
-   and the network is rebuilt from the survivors. Measured 88–105
-   feeders (mean ≈ 475–570 customers each) at 50 000 customers.
-   Sections in high-density cells are underground cable (drawn dashed),
-   the rest overhead.
+   starved subs bid back in. Station budget `SUB_MAX_COUNT = 60`; a
+   station needs `SUB_MIN_CUST = 200` customers to exist — smaller ones
+   are TRIAL-DISSOLVED by the **parsimony pass** (remove, re-bid,
+   re-split, verify receivers stay ≤ `MERGE_HEADROOM = 0.9` of their caps
+   and the express/clip counts don't grow, else roll back — spawn fires
+   at >100%, merge stops at 90%: the gap is the anti-oscillation
+   hysteresis). Measured ≈ 35–47 subs at 50k customers.
+7. **Feeders: THE LADDER + prune** ([js/network.js](js/network.js),
+   [js/main.js](js/main.js)) — each busbar branch of a sub's tree is CUT
+   into connected clusters of ≤ `FEEDER_MAX_CUST = 1000` customers and
+   ≤ `FEEDER_MAX_KM = 200` of conductor, then every cluster resolves to
+   exactly one rung:
+   - **Sibling feeder** — own breaker at the busbar (≤
+     `FEEDERS_MAX_PER_SUB = 12` positions), unloaded exit lead ≤
+     `LEAD_MAX_M = 2 km` running in parallel along the shared corridor —
+     how real urban subs run 8–12 feeders. The released boundary span
+     between siblings becomes a normally-open **sibling tie**.
+   - **Spawn** — a stranded cluster (lead > 2 km) of ≥ 200 customers
+     earns its own zone sub, on its own corridor, within the budget.
+   - **Express feeder** — a stranded 20–200 customer block keeps its
+     long unloaded lead: the sanctioned, labelled EXCEPTION (LOUD when a
+     sub-worthy block was stranded only by an exhausted budget). Zero on
+     the measured seeds.
+   - **Clip** — a feeder still under `FEEDER_MIN_CUST = 20` after
+     folding is PRUNED with its transformers and customers (uneconomic
+     to reticulate) and the network rebuilt from the survivors.
+   Residual violations are reported, never hidden — measured **zero**
+   across the selftest seeds. 96–115 feeders (mean ≈ 430–520 customers)
+   at 50 000 customers. Sections in high-density cells are underground
+   cable (drawn dashed), the rest overhead; leads draw as fine dotted
+   lines along their corridor.
 8. **Subtransmission** ([js/subtx.js](js/subtx.js)) — GXP on a flat
    map-edge cell near the load centroid; least-cost A* lines GXP → each
    sub (slope penalised, ocean blocked, river crossings 6×, road corridors
@@ -151,45 +164,61 @@ MIN_ZIPF_RATIO        = 2.2  // realised largest/median town size too flat
                              // (the peri-urban kernel spreads big-town mass)
 ```
 
-### Rule caps ([js/membership.js](js/membership.js) — all tunable, no minimums)
+### Engineered requirements ([js/membership.js](js/membership.js) — all tunable)
 
 ```
-TX_MAX_CUST      = 100   // customers per distribution transformer
-TX_MAX_M         = 500   // customer → transformer distance (m) — exact
-SUB_MAX_CUST     = 4000  // customers per zone sub
-SUB_MAX_KM       = 50    // transformer → zone sub, by road
-FEEDER_MAX_CUST  = 1000  // customers per feeder (uniform)
-FEEDER_MAX_KM    = 50    // feeder REACH: line distance sub → farthest point
-                         // (flat; total conductor unbounded, feeders branch)
-FEEDER_MIN_CUST  = 20    // feeders under this are pruned entirely
-                         // (with their customers and transformers)
+TX_MAX_CUST         = 100   // customers per distribution transformer
+TX_MAX_M            = 500   // customer → transformer distance (m) — exact
+SUB_MAX_CUST        = 5000  // customers (ICPs) per zone sub
+SUB_MIN_CUST        = 200   // smaller stations are trial-dissolved; also
+                            // the sub-worthiness bar for ladder spawns
+SUB_MAX_COUNT       = 60    // station budget for the whole map
+SUB_MAX_KM          = 50    // transformer → zone sub, by road
+FEEDER_MAX_CUST     = 1000  // customers per feeder (uniform)
+FEEDER_MAX_KM       = 200   // total CONDUCTOR per feeder (reach uncapped)
+FEEDERS_MAX_PER_SUB = 12    // breaker positions per station
+FEEDER_MIN_CUST     = 20    // feeders under this are pruned entirely
+LEAD_MAX_M          = 2000  // max unloaded exit lead for a sibling feeder;
+                            // beyond this a circuit is an EXPRESS feeder
+MERGE_HEADROOM      = 0.9   // parsimony fills receivers to 90% at most
 ```
 
-Rules are enforced by construction wherever possible; the residue (sub
-totals drifting past the cap at weighted-Voronoi boundaries, realised
-distances after siting, irreducible single-node overshoots) is CHECKED
-and reported in the Checks panel as **tunable** entries that do not gate
-the selftest — correctness checks (conservation, every-TX-mapped,
-monotonicity, fault conservation) do. Measured on the test seeds: zero
-rule violations.
+Rules are enforced by construction wherever possible; the residue (a
+station parsimony cannot lawfully dissolve, rare irreducible overshoots)
+is CHECKED and reported in the Checks panel as **tunable** entries that
+do not gate the selftest — correctness checks (conservation,
+every-TX-mapped, monotonicity, fault conservation) do. Measured on the
+selftest seeds: **zero cap violations, zero express feeders needed**.
 
 9. **Reliability** ([js/reliability.js](js/reliability.js)) — per-feeder
    SAIDI with separate overhead/underground fault rates (defaults 0.08 /
    0.02 faults·km⁻¹·yr⁻¹, both adjustable live in the UI); outage = crew
    travel from the sub at 50 km/h along the line route + flat 120 min
    repair (both line types — flatters cables, labelled); switching
-   restores upstream customers at a flat 45 min. **Backfeed**: adjacent
-   feeders share one normally-open TIE (the shortest unused-road corridor
-   ≤ 2 km between them, found by a labelled Dijkstra over unused edges);
-   every maximal device-bounded subtree in the wait set that reaches a
-   tie and does not contain the fault — lateral branches included — is
+   restores upstream customers at a flat 45 min. **Lateral fuses are
+   standard construction**, part of the device-free baseline (no utility
+   operates fuseless): every section with ≤ `LATERAL_FUSE_MAX_CUST = 30`
+   downstream customers is fuse-protected — a fault there drops only its
+   own subtree for travel + repair, the feeder rides through; deepest
+   fuse wins; devices on fused laterals gain nothing, so the greedy
+   spends its budget on trunks. A fault on a feeder's unloaded exit LEAD
+   interrupts that whole feeder; sibling circuits sharing a corridor
+   fault independently (common-mode shared-structure events not
+   modelled — labelled). **Backfeed**: adjacent feeders share one
+   normally-open TIE (the shortest unused-road corridor ≤ 2 km between
+   them, found by a labelled Dijkstra over unused edges — released
+   sibling boundary spans are picked up here for free, so sibling
+   feeders tie to each other first, as real urban feeders do); every
+   maximal device-bounded subtree in the wait set that reaches a tie and
+   does not contain the fault — lateral branches included — is
    re-energised from the neighbouring feeder at the same flat 45 min
    (tie capacity unlimited, neighbour assumed healthy; labelled). Greedy
    candidate gains are EXACT per-feeder re-evaluations, so placement
-   stays provably monotone with backfeed in play. There are NO express
-   runs — every feeder roots at its sub busbar — so the device-free
-   baseline is honestly high (one breaker per branch and nothing else)
-   and devices visibly earn their keep.
+   stays provably monotone with backfeed in play. The baseline
+   (breakers + fuses, no automation) is CALIBRATED to a realistic
+   planning band — a tunable check asserts 150–500 min/yr, measured
+   ≈ 200–245 on the selftest seeds — so devices improve a plausible
+   network rather than a fictional fuseless one.
 
 ## Interactive features
 

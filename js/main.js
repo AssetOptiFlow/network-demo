@@ -136,6 +136,19 @@ function generateOnce(params) {
     detail: `SAIDI ${saidiBefore.toFixed(2)} min/yr, ${edgesBefore} sections, ` +
       `${roadEdgesBefore} road edges — all unchanged by (re)building ${subtx.lines.length} subtx lines`,
   });
+  // Calibration: the device-free-but-fused baseline should sit in a
+  // realistic planning band. Real NZ networks report 60–300 min/yr WITH
+  // their automation; the baseline (breakers + standard lateral fusing,
+  // no automation) belongs somewhat above that. A rule change that blows
+  // this band should fail visibly here, not be discovered by feel.
+  const CAL_BAND = [150, 500];
+  world.checks.push({
+    name: `Baseline SAIDI calibration (${CAL_BAND[0]}–${CAL_BAND[1]} min/yr band)`,
+    tunable: true,
+    pass: saidiBefore >= CAL_BAND[0] && saidiBefore <= CAL_BAND[1],
+    detail: `baseline ${saidiBefore.toFixed(0)} min/yr — breakers + standard lateral ` +
+      `fusing, no automation; devices placed in the UI cut it from here`,
+  });
   world.validation = validateWorld(world);
   mark("checks", t);
   timings.total = Math.round(performance.now() - t0);
@@ -346,6 +359,9 @@ function selftest() {
         reassigned: net.membership.reassigned,
         maxFeedersPerSub: Math.max(0, ...net.subs.map(s => net.feeders.filter(f => f.sub === s.id).length)),
         easementSpans: net.membership.easementSpans,
+        expressFeeders: net.membership.expressFeeders,
+        loudExpress: net.membership.loudExpress,
+        parsimony: net.membership.parsimony,
         ruleViolations: net.membership.ruleViolations,
       },
       txs: net.txs.length,

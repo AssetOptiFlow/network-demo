@@ -1,15 +1,25 @@
-// membership.js — the RULES that map customers → transformers → zone subs.
-// Simple caps, no minimums; sub and feeder counts EMERGE from the rules.
+// membership.js — the ENGINEERED REQUIREMENTS that map customers →
+// transformers → feeders → zone subs. Construction resolves every load
+// block down a LADDER (network.js): split an over-cap branch into SIBLING
+// feeders sharing the exit corridor → spawn a zone sub on the corridor
+// when a stranded block is sub-worthy → EXPRESS feeder for stranded blocks
+// too small for a station (labelled exception, never the rule) → clip
+// only below FEEDER_MIN_CUST. Deletion never touches a block big enough
+// to matter.
 //
 //   customers → TX:   ≤ TX_MAX_M from the transformer OR ≤ TX_MAX_CUST
 //                     (rural maxes out on distance, urban on count)
-//   TX → zone sub:    ≤ SUB_MAX_KM by road OR ≤ SUB_MAX_CUST per sub
-//   feeders:          ≤ FEEDER_MAX_CUST and ≤ FEEDER_MAX_KM circuit length
-//                     (owned + trunk run) — one FLAT length cap, no
-//                     long-rural tier; a feeder that carries fewer than
-//                     FEEDER_MIN_CUST customers is PRUNED — the feeder,
-//                     its transformers AND its customers are removed and
-//                     the network is rebuilt from the survivors
+//   TX → zone sub:    ≤ SUB_MAX_KM by road, ≤ SUB_MAX_CUST per sub,
+//                     ≥ SUB_MIN_CUST per sub (smaller stations are
+//                     trial-dissolved by the parsimony pass), and at most
+//                     SUB_MAX_COUNT stations on the map
+//   feeders:          ≤ FEEDER_MAX_CUST and ≤ FEEDER_MAX_KM of CONDUCTOR;
+//                     ≤ FEEDERS_MAX_PER_SUB breaker positions per sub; a
+//                     sibling feeder's unloaded exit lead ≤ LEAD_MAX_M
+//                     (longer unloaded runs are EXPRESS feeders — allowed
+//                     as a labelled exception for 20–200 customer blocks);
+//                     a feeder still under FEEDER_MIN_CUST after folding
+//                     is PRUNED with its transformers and customers
 //                     (uneconomic to reticulate)
 //
 // The membership atom is the LOAD NODE — a road node with ≥ 1 TX snapped to
@@ -21,14 +31,25 @@
 
 export const TX_MAX_CUST = 100;      // customers per distribution transformer
 export const TX_MAX_M = 500;         // customer → transformer distance (m)
-export const SUB_MAX_CUST = 4000;    // customers per zone sub
+export const SUB_MAX_CUST = 5000;    // customers (ICPs) per zone sub
+export const SUB_MIN_CUST = 200;     // stations below this are trial-dissolved;
+                                     // doubles as the sub-worthiness threshold
+                                     // for spawning on a stranded block
+export const SUB_MAX_COUNT = 60;     // station budget for the whole map
 export const SUB_MAX_KM = 50;        // transformer → zone sub, by road
 export const FEEDER_MAX_CUST = 1000; // customers per feeder (uniform)
-export const FEEDER_MAX_KM = 50;     // feeder REACH — line distance from the
-                                     // sub to the farthest point (flat; total
-                                     // conductor is unbounded, feeders branch)
+export const FEEDER_MAX_KM = 200;    // total CONDUCTOR per feeder, km
+                                     // (reach is map-bounded and uncapped)
+export const FEEDERS_MAX_PER_SUB = 12; // breaker positions per station
 export const FEEDER_MIN_CUST = 20;   // feeders under this are pruned entirely
                                      // (with their customers and transformers)
+export const LEAD_MAX_M = 2000;      // max unloaded exit lead for a SIBLING
+                                     // feeder sharing its sub's corridor;
+                                     // beyond this a circuit is EXPRESS
+export const MERGE_HEADROOM = 0.9;   // parsimony may only absorb load into a
+                                     // station up to this share of its caps
+                                     // (spawn fires at >100% — the gap is the
+                                     // hysteresis that prevents oscillation)
 
 // Urban/rural is REPORTING-ONLY now (the caps are uniform): a customer is
 // urban when local density ≥ URBAN_CUST_PER_KM2 within DENSITY_RADIUS_M.
