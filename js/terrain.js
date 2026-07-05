@@ -1,35 +1,40 @@
-// terrain.js — synthetic geography for a ~100 x 100 km map.
+// terrain.js — synthetic geography for a ~100 x 70 km map.
 //
 // ASSUMPTIONS (also surfaced in the UI assumptions panel):
-//  - Map is 100 x 100 km sampled on a 200 m grid (500 x 500 cells).
+//  - Map is 100 km wide x 70 km high, sampled on a 200 m grid
+//    (500 x 350 cells) — landscape aspect to suit the browser viewport.
 //  - Sea lies along one map edge (chosen from the seed); elevation is
 //    fBm noise plus a ramp away from that edge, so the coastline wiggles.
 //  - Exactly one river is traced from a high inland cell to the sea by
 //    noisy steepest descent; it is carved into the elevation and
-//    rasterised as water (60–140 m wide).
+//    rasterised as water (60–210 m wide).
 //  - "Buildable" = land in the main connected landmass with slope < 0.35 m/m.
 //  - Elevation is purely invented (no real data). Vertical scale ~0–700 m.
 
 import { fbm } from "./noise.js";
 
-export const MAP_SIZE = 100000;  // metres
+export const MAP_W = 100000;     // metres, west–east
+export const MAP_H = 70000;     // metres, north–south
+export const MAP_MAX = Math.max(MAP_W, MAP_H);
 export const CELL = 200;         // metres per grid cell
-export const GRID_N = MAP_SIZE / CELL; // 500
+export const GRID_NX = MAP_W / CELL; // 500
+export const GRID_NY = MAP_H / CELL; // 350
 
 const ELEV_SCALE_M = 700;        // multiplier from unit elevation to metres
 const SLOPE_BUILD_MAX = 0.35;    // m/m — steeper than this is unbuildable
+const NOISE_WL_M = 30000 / 3.4;  // terrain wavelength (m) — size-independent
 
 export class Terrain {
   constructor(rng) {
-    const n = GRID_N;
-    this.n = n;
-    this.elev = new Float32Array(n * n);   // unit elevation, <0 means sea
-    this.slope = new Float32Array(n * n);  // m/m
-    this.water = new Uint8Array(n * n);    // 0 land, 1 sea, 2 river
-    this.mainland = new Uint8Array(n * n); // 1 = in largest land component
-    this.bridgeCell = new Uint8Array(n * n); // set by road builder
-    this.riverPath = [];                   // [{x,y,w}] metres
-    this.bridges = [];                     // [{x,y}] set by road builder
+    const nx = GRID_NX, ny = GRID_NY;
+    this.nx = nx; this.ny = ny;
+    this.elev = new Float32Array(nx * ny);   // unit elevation, <0 means sea
+    this.slope = new Float32Array(nx * ny);  // m/m
+    this.water = new Uint8Array(nx * ny);    // 0 land, 1 sea, 2 river
+    this.mainland = new Uint8Array(nx * ny); // 1 = in largest land component
+    this.bridgeCell = new Uint8Array(nx * ny); // set by road builder
+    this.riverPath = [];                     // [{x,y,w}] metres
+    this.bridges = [];                       // [{x,y}] set by road builder
 
     const seedT = Math.floor(rng.fork("elev").float() * 1e9);
     this.noiseSeed = seedT;
@@ -42,35 +47,36 @@ export class Terrain {
     this._floodMainland();
   }
 
-  idx(cx, cy) { return cy * this.n + cx; }
-  inGrid(cx, cy) { return cx >= 0 && cy >= 0 && cx < this.n && cy < this.n; }
+  idx(cx, cy) { return cy * this.nx + cx; }
+  inGrid(cx, cy) { return cx >= 0 && cy >= 0 && cx < this.nx && cy < this.ny; }
   cellOf(x, y) {
     return [
-      Math.min(this.n - 1, Math.max(0, Math.floor(x / CELL))),
-      Math.min(this.n - 1, Math.max(0, Math.floor(y / CELL))),
+      Math.min(this.nx - 1, Math.max(0, Math.floor(x / CELL))),
+      Math.min(this.ny - 1, Math.max(0, Math.floor(y / CELL))),
     ];
   }
   cellCentre(cx, cy) { return [(cx + 0.5) * CELL, (cy + 0.5) * CELL]; }
 
   // Normalised distance from the coast edge (0 at coast, 1 far side).
   _coastDist(cx, cy) {
-    const t = this.n - 1;
     switch (this.coastEdge) {
-      case 0: return cx / t;
-      case 1: return (t - cx) / t;
-      case 2: return cy / t;
-      default: return (t - cy) / t;
+      case 0: return cx / (this.nx - 1);
+      case 1: return (this.nx - 1 - cx) / (this.nx - 1);
+      case 2: return cy / (this.ny - 1);
+      default: return (this.ny - 1 - cy) / (this.ny - 1);
     }
   }
+  // Length (m) of the axis perpendicular to the coast — converts the
+  // normalised coast distance back to metres.
+  coastAxisM() { return this.coastEdge <= 1 ? MAP_W : MAP_H; }
 
   _buildElevation(seed) {
-    const n = this.n;
-    const freq = 3.4 * MAP_SIZE / 30000; // keep ~9 km terrain wavelength at any map size
-    for (let cy = 0; cy < n; cy++) {
-      for (let cx = 0; cx < n; cx++) {
-        const u = cx / n, v = cy / n;
+    const nx = this.nx, ny = this.ny;
+    for (let cy = 0; cy < ny; cy++) {
+      for (let cx = 0; cx < nx; cx++) {
         const g = this._coastDist(cx, cy);
-        const nz = fbm(u * freq, v * freq, seed, 5);
+        // noise in PHYSICAL coordinates so hills stay ~9 km at any aspect
+        const nz = fbm(cx * CELL / NOISE_WL_M, cy * CELL / NOISE_WL_M, seed, 5);
         // Ramp keeps the coast edge below sea level, inland rises.
         let e = nz * 0.52 + g * 1.35 - 0.30;
         this.elev[this.idx(cx, cy)] = e;
@@ -82,19 +88,20 @@ export class Terrain {
   // Ocean = sea cells connected to the coast edge. Inland elev<0 pockets
   // stay water (lakes) but are NOT ocean — the river must reach the ocean.
   _floodOcean() {
-    const n = this.n;
-    this.ocean = new Uint8Array(n * n);
+    const nx = this.nx, ny = this.ny;
+    this.ocean = new Uint8Array(nx * ny);
     const stack = [];
-    for (let k = 0; k < n; k++) {
+    const coastLen = this.coastEdge <= 1 ? ny : nx;
+    for (let k = 0; k < coastLen; k++) {
       const [cx, cy] = this.coastEdge === 0 ? [0, k]
-        : this.coastEdge === 1 ? [n - 1, k]
-        : this.coastEdge === 2 ? [k, 0] : [k, n - 1];
+        : this.coastEdge === 1 ? [nx - 1, k]
+        : this.coastEdge === 2 ? [k, 0] : [k, ny - 1];
       const i = this.idx(cx, cy);
       if (this.water[i] === 1 && !this.ocean[i]) { this.ocean[i] = 1; stack.push(i); }
     }
     while (stack.length) {
       const i = stack.pop();
-      const cx = i % n, cy = (i / n) | 0;
+      const cx = i % nx, cy = (i / nx) | 0;
       for (const [ax, ay] of [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]]) {
         if (!this.inGrid(ax, ay)) continue;
         const j = this.idx(ax, ay);
@@ -104,28 +111,29 @@ export class Terrain {
   }
 
   elevAt(x, y) { // bilinear, unit elevation
-    const gx = Math.min(this.n - 1.001, Math.max(0, x / CELL - 0.5));
-    const gy = Math.min(this.n - 1.001, Math.max(0, y / CELL - 0.5));
+    const gx = Math.min(this.nx - 1.001, Math.max(0, x / CELL - 0.5));
+    const gy = Math.min(this.ny - 1.001, Math.max(0, y / CELL - 0.5));
     const x0 = Math.floor(gx), y0 = Math.floor(gy);
     const fx = gx - x0, fy = gy - y0;
-    const e = this.elev, n = this.n;
-    const a = e[y0 * n + x0], b = e[y0 * n + x0 + 1];
-    const c = e[(y0 + 1) * n + x0], d = e[(y0 + 1) * n + x0 + 1];
+    const e = this.elev, nx = this.nx;
+    const a = e[y0 * nx + x0], b = e[y0 * nx + x0 + 1];
+    const c = e[(y0 + 1) * nx + x0], d = e[(y0 + 1) * nx + x0 + 1];
     return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
   }
 
   _traceRiver(rng) {
-    const n = this.n;
+    const nx = this.nx, ny = this.ny;
     // Source: a high land cell hard against the edge OPPOSITE the coast,
     // so the river spans the whole map and genuinely bisects it — roads
     // between towns on either side are forced onto bridges.
     let candidates = [];
-    const edgeBand = (n - 3) / (n - 1); // outermost ~2 cells
-    for (let cy = 1; cy < n - 1; cy++) {
-      for (let cx = 1; cx < n - 1; cx++) {
+    const farAxis = this.coastEdge <= 1 ? nx : ny;
+    const edgeBand = (farAxis - 3) / (farAxis - 1); // outermost ~2 cells
+    for (let cy = 1; cy < ny - 1; cy++) {
+      for (let cx = 1; cx < nx - 1; cx++) {
         if (this._coastDist(cx, cy) < edgeBand) continue; // far edge band only
         // central 60% along the far edge, so the river cannot hug a side
-        const lat = (this.coastEdge <= 1 ? cy : cx) / (n - 1);
+        const lat = this.coastEdge <= 1 ? cy / (ny - 1) : cx / (nx - 1);
         if (lat < 0.2 || lat > 0.8) continue;
         const i = this.idx(cx, cy);
         if (this.water[i]) continue;
@@ -134,8 +142,8 @@ export class Terrain {
       }
     }
     if (candidates.length === 0) { // degenerate fallback: anywhere inland
-      for (let cy = 4; cy < n - 4; cy += 2) {
-        for (let cx = 4; cx < n - 4; cx += 2) {
+      for (let cy = 4; cy < ny - 4; cy += 2) {
+        for (let cx = 4; cx < nx - 4; cx += 2) {
           const i = this.idx(cx, cy);
           if (this.water[i]) continue;
           candidates.push({ cx, cy, score: this.elev[i] * this._coastDist(cx, cy) });
@@ -148,8 +156,8 @@ export class Terrain {
     // Pin the head of the river to the actual map border so no road can
     // route around the headwater — crossings must use bridges.
     const border = [
-      { x: MAP_SIZE, y: py }, { x: 0, y: py },
-      { x: px, y: MAP_SIZE }, { x: px, y: 0 },
+      { x: MAP_W, y: py }, { x: 0, y: py },
+      { x: px, y: MAP_H }, { x: px, y: 0 },
     ][this.coastEdge];
     const pts0 = [];
     const gap = Math.hypot(border.x - px, border.y - py);
@@ -182,7 +190,7 @@ export class Terrain {
       dx /= dlen; dy /= dlen;
       mvx = dx; mvy = dy;
       px += dx * step; py += dy * step;
-      if (px < 0 || py < 0 || px > MAP_SIZE || py > MAP_SIZE) break;
+      if (px < 0 || py < 0 || px > MAP_W || py > MAP_H) break;
       // Carve so the river never flows uphill visually.
       const ci = this.idx(...this.cellOf(px, py));
       const prev = this.elev[this.idx(...this.cellOf(pts[pts.length - 1].x, pts[pts.length - 1].y))];
@@ -199,9 +207,9 @@ export class Terrain {
     for (const p of pts) {
       const r = p.w / 2 + CELL * 0.35;
       const c0x = Math.max(0, Math.floor((p.x - r) / CELL));
-      const c1x = Math.min(n - 1, Math.floor((p.x + r) / CELL));
+      const c1x = Math.min(nx - 1, Math.floor((p.x + r) / CELL));
       const c0y = Math.max(0, Math.floor((p.y - r) / CELL));
-      const c1y = Math.min(n - 1, Math.floor((p.y + r) / CELL));
+      const c1y = Math.min(ny - 1, Math.floor((p.y + r) / CELL));
       for (let cy = c0y; cy <= c1y; cy++) {
         for (let cx = c0x; cx <= c1x; cx++) {
           const [mx, my] = this.cellCentre(cx, cy);
@@ -215,13 +223,13 @@ export class Terrain {
   }
 
   _computeSlope() {
-    const n = this.n;
-    for (let cy = 0; cy < n; cy++) {
-      for (let cx = 0; cx < n; cx++) {
+    const nx = this.nx, ny = this.ny;
+    for (let cy = 0; cy < ny; cy++) {
+      for (let cx = 0; cx < nx; cx++) {
         const xm = this.elev[this.idx(Math.max(0, cx - 1), cy)];
-        const xp = this.elev[this.idx(Math.min(n - 1, cx + 1), cy)];
+        const xp = this.elev[this.idx(Math.min(nx - 1, cx + 1), cy)];
         const ym = this.elev[this.idx(cx, Math.max(0, cy - 1))];
-        const yp = this.elev[this.idx(cx, Math.min(n - 1, cy + 1))];
+        const yp = this.elev[this.idx(cx, Math.min(ny - 1, cy + 1))];
         const dzdx = (xp - xm) * ELEV_SCALE_M / (2 * CELL);
         const dzdy = (yp - ym) * ELEV_SCALE_M / (2 * CELL);
         this.slope[this.idx(cx, cy)] = Math.hypot(dzdx, dzdy);
@@ -234,18 +242,18 @@ export class Terrain {
   // Customers/roads are restricted to land cells of this component, so
   // nothing gets stranded on an island or ocean-locked pocket.
   _floodMainland() {
-    const n = this.n;
-    const comp = new Int32Array(n * n).fill(-1);
+    const nx = this.nx, ny = this.ny;
+    const comp = new Int32Array(nx * ny).fill(-1);
     let best = -1, bestSize = 0, nComp = 0;
     const stack = [];
-    for (let s = 0; s < n * n; s++) {
+    for (let s = 0; s < nx * ny; s++) {
       if (this.water[s] === 1 || comp[s] !== -1) continue;
       let size = 0;
       stack.push(s); comp[s] = nComp;
       while (stack.length) {
         const i = stack.pop();
         if (this.water[i] === 0) size++; // component size = land cells only
-        const cx = i % n, cy = (i / n) | 0;
+        const cx = i % nx, cy = (i / nx) | 0;
         const nb = [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]];
         for (const [ax, ay] of nb) {
           if (!this.inGrid(ax, ay)) continue;
@@ -256,7 +264,7 @@ export class Terrain {
       if (size > bestSize) { bestSize = size; best = nComp; }
       nComp++;
     }
-    for (let i = 0; i < n * n; i++) {
+    for (let i = 0; i < nx * ny; i++) {
       this.mainland[i] = comp[i] === best && this.water[i] === 0 ? 1 : 0;
     }
   }
@@ -314,24 +322,24 @@ export class Terrain {
   // segment-vs-water tests so detection can never miss a cell corner the
   // way point sampling can.
   segmentHits(x0, y0, x1, y1, pred) {
-    const n = this.n;
-    let cx = Math.min(n - 1, Math.max(0, Math.floor(x0 / CELL)));
-    let cy = Math.min(n - 1, Math.max(0, Math.floor(y0 / CELL)));
-    const tx = Math.min(n - 1, Math.max(0, Math.floor(x1 / CELL)));
-    const ty = Math.min(n - 1, Math.max(0, Math.floor(y1 / CELL)));
-    if (pred(cy * n + cx)) return true;
+    const nx = this.nx, ny = this.ny;
+    let cx = Math.min(nx - 1, Math.max(0, Math.floor(x0 / CELL)));
+    let cy = Math.min(ny - 1, Math.max(0, Math.floor(y0 / CELL)));
+    const tx = Math.min(nx - 1, Math.max(0, Math.floor(x1 / CELL)));
+    const ty = Math.min(ny - 1, Math.max(0, Math.floor(y1 / CELL)));
+    if (pred(cy * nx + cx)) return true;
     const dx = x1 - x0, dy = y1 - y0;
     const stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1;
     let tMaxX = dx !== 0 ? ((cx + (dx > 0 ? 1 : 0)) * CELL - x0) / dx : Infinity;
     let tMaxY = dy !== 0 ? ((cy + (dy > 0 ? 1 : 0)) * CELL - y0) / dy : Infinity;
     const tDeltaX = dx !== 0 ? Math.abs(CELL / dx) : Infinity;
     const tDeltaY = dy !== 0 ? Math.abs(CELL / dy) : Infinity;
-    let guard = 2 * n + 4;
+    let guard = 2 * (nx + ny) + 4;
     while ((cx !== tx || cy !== ty) && guard-- > 0) {
       if (tMaxX < tMaxY) { cx += stepX; tMaxX += tDeltaX; }
       else { cy += stepY; tMaxY += tDeltaY; }
-      if (cx < 0 || cy < 0 || cx >= n || cy >= n) break;
-      if (pred(cy * n + cx)) return true;
+      if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) break;
+      if (pred(cy * nx + cx)) return true;
     }
     return false;
   }
@@ -356,17 +364,17 @@ export class Terrain {
 // Grid BFS distance (metres, 4-connected, not through ocean) from a seed
 // cell set — shared by the density field (road distance) and siting code.
 export function bfsDistanceM(terrain, seedCells) {
-  const n = terrain.n;
-  const dist = new Float32Array(n * n).fill(Infinity);
+  const nx = terrain.nx, ny = terrain.ny;
+  const dist = new Float32Array(nx * ny).fill(Infinity);
   let frontier = [];
   for (const c of seedCells) { dist[c] = 0; frontier.push(c); }
   while (frontier.length) {
     const next = [];
     for (const i of frontier) {
-      const cx = i % n, cy = (i / n) | 0;
+      const cx = i % nx, cy = (i / nx) | 0;
       for (const [ax, ay] of [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]]) {
-        if (ax < 0 || ay < 0 || ax >= n || ay >= n) continue;
-        const j = ay * n + ax;
+        if (ax < 0 || ay < 0 || ax >= nx || ay >= ny) continue;
+        const j = ay * nx + ax;
         if (terrain.water[j] === 1) continue;
         if (dist[j] > dist[i] + CELL) { dist[j] = dist[i] + CELL; next.push(j); }
       }

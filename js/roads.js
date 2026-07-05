@@ -20,7 +20,7 @@
 //  - Any disconnected road component is repaired by A* — the finished
 //    graph is asserted fully connected.
 
-import { CELL, GRID_N, MAP_SIZE, bfsDistanceM } from "./terrain.js";
+import { CELL, GRID_NX, GRID_NY, MAP_W, MAP_H, bfsDistanceM } from "./terrain.js";
 
 export const CLS_ARTERIAL = 0, CLS_COLLECTOR = 1, CLS_LOCAL = 2, CLS_EASEMENT = 3;
 
@@ -121,10 +121,13 @@ export class RoadGraph {
     if (a === b) return;
     const key = a < b ? a * 16777216 + b : b * 16777216 + a;
     if (this.edgeKeys.has(key)) {
-      // keep the more important class
+      // keep the more important class, and never lose a bridge flag
       for (const ei of this.adj[a]) {
         const e = this.edges[ei];
-        if ((e.a === b || e.b === b) && cls < e.cls) e.cls = cls;
+        if (e.a === b || e.b === b) {
+          if (cls < e.cls) e.cls = cls;
+          if (bridge) e.bridge = true;
+        }
       }
       return;
     }
@@ -136,13 +139,19 @@ export class RoadGraph {
     this.adj[b].push(id);
   }
 
-  addPolyline(pts, cls, bridgeSpans = null) {
-    let prev = -1;
+  // bridgeTest(xa, ya, xb, yb) → bool, evaluated on the SNAPPED node
+  // coordinates — node dedupe can shift a polyline point a few metres, so
+  // testing the raw points can disagree with the exact-traversal check
+  // that later audits the finished edge.
+  addPolyline(pts, cls, bridgeTest = null) {
     const ids = [];
     for (const [x, y] of pts) ids.push(this.node(x, y));
     for (let i = 1; i < ids.length; i++) {
-      const isBridge = bridgeSpans ? bridgeSpans[i - 1] : false;
-      this.addEdge(ids[i - 1], ids[i], cls, isBridge);
+      const a = ids[i - 1], b = ids[i];
+      const isBridge = bridgeTest
+        ? bridgeTest(this.nx[a], this.ny[a], this.nx[b], this.ny[b])
+        : false;
+      this.addEdge(a, b, cls, isBridge);
     }
     return ids;
   }
@@ -175,7 +184,7 @@ export class RoadGraph {
 export class GridRouter {
   constructor(terrain) {
     this.t = terrain;
-    const n = GRID_N * GRID_N;
+    const n = GRID_NX * GRID_NY;
     this.g = new Float64Array(n);
     this.came = new Int32Array(n);
     this.stamp = new Int32Array(n);
@@ -190,10 +199,10 @@ export class GridRouter {
     return t.slopeCostMul(i);
   }
   route(x0, y0, x1, y1) {
-    const t = this.t, n = GRID_N;
+    const t = this.t, nx = GRID_NX, ny = GRID_NY;
     const [sx, sy] = t.cellOf(x0, y0);
     const [tx, ty] = t.cellOf(x1, y1);
-    const start = sy * n + sx, goal = ty * n + tx;
+    const start = sy * nx + sx, goal = ty * nx + tx;
     this.gen++;
     const { g, came, stamp } = this;
     const heap = new MinHeap();
@@ -205,13 +214,13 @@ export class GridRouter {
       if (cur === goal) break;
       if (closed.has(cur)) continue;
       closed.add(cur);
-      const cx = cur % n, cy = (cur / n) | 0;
+      const cx = cur % nx, cy = (cur / nx) | 0;
       for (let dy = -1; dy <= 1; dy++) {
         for (let dx = -1; dx <= 1; dx++) {
           if (!dx && !dy) continue;
           const ax = cx + dx, ay = cy + dy;
-          if (ax < 0 || ay < 0 || ax >= n || ay >= n) continue;
-          const ni = ay * n + ax;
+          if (ax < 0 || ay < 0 || ax >= nx || ay >= ny) continue;
+          const ni = ay * nx + ax;
           const mul = this.cellMul(ni);
           if (mul < 0) continue;
           const step = CELL * (dx && dy ? Math.SQRT2 : 1) * mul;
@@ -244,7 +253,7 @@ export class GridRouter {
 // arterial, rural spur, or connectivity repair — must go through here so
 // that river crossings are always bridges. Returns end node ids.
 function addRoutedCells(terrain, graph, cells, cls) {
-  const n = GRID_N;
+  const n = GRID_NX; // linear cell index → (c % n, (c / n) | 0)
   if (!cells || cells.length < 2) return null;
   let run = [];
   const flushRun = () => {
@@ -280,13 +289,10 @@ function addRoutedCells(terrain, graph, cells, cls) {
       runStart = i;
     }
   }
-  // bridge flag per segment: exact traversal, no sampling gaps
-  const spans = [];
-  for (let i = 1; i < simple.length; i++) {
-    spans.push(terrain.segmentTouchesRiver(
-      simple[i - 1][0], simple[i - 1][1], simple[i][0], simple[i][1]));
-  }
-  const ids = graph.addPolyline(simple, cls, spans);
+  // bridge flag per segment: exact traversal on the snapped node
+  // coordinates, so the flag always agrees with the river-crossing check
+  const ids = graph.addPolyline(simple, cls,
+    (xa, ya, xb, yb) => terrain.segmentTouchesRiver(xa, ya, xb, yb));
   return { first: ids[0], last: ids[ids.length - 1] };
 }
 
@@ -296,7 +302,7 @@ function addRoutedCells(terrain, graph, cells, cls) {
 export function buildRoads(terrain, towns, corridors, rng) {
   const graph = new RoadGraph();
   const router = new GridRouter(terrain);
-  const n = GRID_N;
+  const n = GRID_NX; // linear cell index → (c % n, (c / n) | 0)
   const addRoutedPath = (cells, cls) => addRoutedCells(terrain, graph, cells, cls);
   const arterialCellPaths = [];
 
@@ -380,7 +386,7 @@ export function buildRoads(terrain, towns, corridors, rng) {
         const wob = 0.28 + 0.62 * fray; // organic wobble everywhere
         x += (rT.float() - 0.5) * s * wob;
         y += (rT.float() - 0.5) * s * wob;
-        if (x < 0 || y < 0 || x > MAP_SIZE || y > MAP_SIZE) continue;
+        if (x < 0 || y < 0 || x > MAP_W || y > MAP_H) continue;
         if (!terrain.buildableAt(x, y)) continue;
         const gauss = Math.exp(-rad * rad / (2 * t.sigma * t.sigma));
         if (gauss < 0.075) continue;
@@ -420,7 +426,7 @@ export function buildRoads(terrain, towns, corridors, rng) {
       const len = rSpur.range(1100, 5200);
       const tx = px + (-(py - qy) / dl) * len * side + (rSpur.float() - 0.5) * 900;
       const ty = py + ((px - qx) / dl) * len * side + (rSpur.float() - 0.5) * 900;
-      if (tx < 400 || ty < 400 || tx > MAP_SIZE - 400 || ty > MAP_SIZE - 400) continue;
+      if (tx < 400 || ty < 400 || tx > MAP_W - 400 || ty > MAP_H - 400) continue;
       if (!terrain.buildableAt(tx, ty) || terrain.slopeAt(tx, ty) > 0.3) continue;
       const cellsSpur = router.route(px, py, tx, ty);
       if (cellsSpur) {
@@ -434,7 +440,7 @@ export function buildRoads(terrain, towns, corridors, rng) {
     if (rSpur.float() > 0.55) continue; // many spurs fork once more
     const tx = sx + (rSpur.float() - 0.5) * 5200;
     const ty = sy + (rSpur.float() - 0.5) * 5200;
-    if (tx < 400 || ty < 400 || tx > MAP_SIZE - 400 || ty > MAP_SIZE - 400) continue;
+    if (tx < 400 || ty < 400 || tx > MAP_W - 400 || ty > MAP_H - 400) continue;
     if (!terrain.buildableAt(tx, ty) || terrain.slopeAt(tx, ty) > 0.3) continue;
     const cellsSpur = router.route(sx, sy, tx, ty);
     if (cellsSpur) {
@@ -567,9 +573,12 @@ function repairConnectivity(graph, terrain, router) {
       const cells = router.route(graph.nx[bestA], graph.ny[bestA], graph.nx[bestB], graph.ny[bestB]);
       const ends = addRoutedCells(terrain, graph, cells, CLS_LOCAL);
       if (!ends) return { merges, connected: false };
-      // stitch both ends (each stays within its own cell → no water crossing)
-      graph.addEdge(bestA, ends.first, CLS_LOCAL);
-      graph.addEdge(ends.last, bestB, CLS_LOCAL);
+      // stitch both ends — bridge-flagged exactly, since an endpoint can
+      // be a bridge node sitting inside a river cell
+      graph.addEdge(bestA, ends.first, CLS_LOCAL, terrain.segmentTouchesRiver(
+        graph.nx[bestA], graph.ny[bestA], graph.nx[ends.first], graph.ny[ends.first]));
+      graph.addEdge(ends.last, bestB, CLS_LOCAL, terrain.segmentTouchesRiver(
+        graph.nx[ends.last], graph.ny[ends.last], graph.nx[bestB], graph.ny[bestB]));
     }
     merges++;
   }

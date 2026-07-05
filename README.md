@@ -1,11 +1,12 @@
 # NZ-style Distribution Network Sandbox
 
 **TOY — not a trusted tool.** A procedural, seeded sandbox that invents a
-~100 × 100 km NZ-flavoured patch of geography, settles it, roads it, wires
-it up with a radial 11 kV-ish distribution network, and lets you play with
-reliability (SAIDI, sectionaliser placement, fault playback). Everything is
-invented — no real data — and every modelling assumption is labelled in the
-UI Assumptions panel and in the source. NZ English, metric units.
+~100 × 70 km NZ-flavoured patch of geography (landscape aspect to suit the
+browser viewport), settles it, roads it, wires it up with a radial
+11 kV-ish distribution network, and lets you play with reliability (SAIDI,
+sectionaliser placement, fault playback). Everything is invented — no real
+data — and every modelling assumption is labelled in the UI Assumptions
+panel and in the source. NZ English, metric units.
 
 ## Run it
 
@@ -29,7 +30,7 @@ Optional URL modes:
 
 ## Scaling
 
-Measured (Windows, headless Edge, 100 × 100 km map): all **correctness**
+Measured (Windows, headless Edge, 100 × 70 km map): all **correctness**
 checks pass and greedy stays monotone up to at least **64,000 customers**
 (regen ≈ 0.6–4.7 s across 8k–64k; the fixed 50k UI world regenerates in
 ≈ 3–11 s depending on seed, including the prune rebuilds). The UI samples
@@ -109,7 +110,7 @@ simple rule caps — no fixed counts, no minimums.
    sub** in its far half; a busbar branch that overflows the feeder caps
    spawns one too, and stations that end up within 6 km of each other are
    MERGED when their combined load fits a couple of feeders — the sub
-   count truly emerges (measured ≈ 35 on the 100 km map at 50k customers).
+   count truly emerges (measured ≈ 35 on the 100 × 70 km map at 50k customers).
 7. **Feeders + prune** ([js/network.js](js/network.js),
    [js/main.js](js/main.js)) — feeders are the BUSBAR BRANCHES of each
    sub's shortest-path tree, one per branch: **no deep cuts and no

@@ -16,7 +16,7 @@
 //    PENALTY on existing subtx cells so it takes an independent corridor
 //    (a real security-of-supply tie, not a shadow of the trunk).
 
-import { CELL, GRID_N, MAP_SIZE } from "./terrain.js";
+import { CELL, GRID_NX, GRID_NY } from "./terrain.js";
 import { hash2 } from "./rng.js";
 
 const RIVER_MUL = 6;
@@ -28,7 +28,7 @@ export function buildSubtx(terrain, subs, loadCentroid, roadDistM) {
   const gxp = pickGxp(terrain, loadCentroid, roadDistM);
   if (!gxp || subs.length === 0) return { gxp, lines: [], maxStraightKm: 0 };
 
-  const used = new Uint8Array(GRID_N * GRID_N);
+  const used = new Uint8Array(GRID_NX * GRID_NY);
   const lines = [];
   const order = subs.slice().sort((a, b) =>
     Math.hypot(a.x - gxp.x, a.y - gxp.y) - Math.hypot(b.x - gxp.x, b.y - gxp.y) || a.id - b.id);
@@ -57,10 +57,13 @@ export function buildSubtx(terrain, subs, loadCentroid, roadDistM) {
 // A plausible GXP: flat mainland cell on the map edge nearest the load
 // centroid, preferring cells close to a road corridor.
 function pickGxp(terrain, loadCentroid, roadDistM) {
-  const n = terrain.n;
+  const nx = terrain.nx, ny = terrain.ny;
   let best = null, bestScore = Infinity;
-  for (let k = 0; k < n; k++) {
-    for (const [cx, cy] of [[k, 0], [k, n - 1], [0, k], [n - 1, k]]) {
+  const edgeCells = [];
+  for (let k = 0; k < nx; k++) edgeCells.push([k, 0], [k, ny - 1]);
+  for (let k = 0; k < ny; k++) edgeCells.push([0, k], [nx - 1, k]);
+  {
+    for (const [cx, cy] of edgeCells) {
       const i = terrain.idx(cx, cy);
       if (terrain.water[i] !== 0 || !terrain.mainland[i]) continue;
       const [x, y] = terrain.cellCentre(cx, cy);
@@ -76,12 +79,12 @@ function pickGxp(terrain, loadCentroid, roadDistM) {
 
 // Least-cost A* over the terrain grid with the subtx cost profile.
 function route(terrain, roadDistM, used, x0, y0, x1, y1, isTie) {
-  const n = GRID_N;
+  const nx = GRID_NX, ny = GRID_NY;
   const [sx, sy] = terrain.cellOf(x0, y0);
   const [tx, ty] = terrain.cellOf(x1, y1);
-  const start = sy * n + sx, goal = ty * n + tx;
-  const g = new Float64Array(n * n).fill(Infinity);
-  const came = new Int32Array(n * n).fill(-1);
+  const start = sy * nx + sx, goal = ty * nx + tx;
+  const g = new Float64Array(nx * ny).fill(Infinity);
+  const came = new Int32Array(nx * ny).fill(-1);
   const heap = { f: [], v: [] };
   const push = (f, v) => {
     const F = heap.f, V = heap.v; let i = F.length;
@@ -117,7 +120,7 @@ function route(terrain, roadDistM, used, x0, y0, x1, y1, isTie) {
     if (used[i]) m *= isTie ? TIE_REUSE_PENALTY : SHARED_TRUNK_MUL;
     // micro-siting variation: land access, pockets of bad ground — keeps
     // lines from running ruler-straight across long flat plains
-    m *= 1 + 0.22 * hash2(i % GRID_N, (i / GRID_N) | 0, 7351);
+    m *= 1 + 0.22 * hash2(i % GRID_NX, (i / GRID_NX) | 0, 7351);
     return m;
   };
   g[start] = 0;
@@ -128,13 +131,13 @@ function route(terrain, roadDistM, used, x0, y0, x1, y1, isTie) {
     if (cur === goal) break;
     if (closed.has(cur)) continue;
     closed.add(cur);
-    const cx = cur % n, cy = (cur / n) | 0;
+    const cx = cur % nx, cy = (cur / nx) | 0;
     for (let dy = -1; dy <= 1; dy++) {
       for (let dx = -1; dx <= 1; dx++) {
         if (!dx && !dy) continue;
         const ax = cx + dx, ay = cy + dy;
-        if (ax < 0 || ay < 0 || ax >= n || ay >= n) continue;
-        const ni = ay * n + ax;
+        if (ax < 0 || ay < 0 || ax >= nx || ay >= ny) continue;
+        const ni = ay * nx + ax;
         const m = mul(ni);
         if (m < 0) continue;
         const ng = g[cur] + CELL * (dx && dy ? Math.SQRT2 : 1) * m;
@@ -156,7 +159,7 @@ function route(terrain, roadDistM, used, x0, y0, x1, y1, isTie) {
 }
 
 function cellsToPts(terrain, cells, from, to) {
-  const n = GRID_N;
+  const n = GRID_NX; // linear cell index → (c % n, (c / n) | 0)
   const pts = cells.map(c => terrain.cellCentre(c % n, (c / n) | 0));
   // light simplification for drawing; exact endpoints
   const out = [[from.x, from.y]];

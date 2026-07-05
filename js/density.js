@@ -24,7 +24,7 @@
 //    the same noise family as the terrain, zeroed off buildable land.
 
 import { fbm01 } from "./noise.js";
-import { CELL, GRID_N, MAP_SIZE, bfsDistanceM } from "./terrain.js";
+import { CELL, GRID_NX, GRID_NY, MAP_W, MAP_H, bfsDistanceM } from "./terrain.js";
 import { GridRouter } from "./roads.js";
 
 // Three-tier hierarchy: customer targets as SHARES of the sampled total.
@@ -63,8 +63,8 @@ export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25, nCust = 500
   // sized for the 100 km map so good sites are still densely sampled.
   const cand = [];
   for (let k = 0; k < 4000; k++) {
-    const x = r.range(1500, MAP_SIZE - 1500);
-    const y = r.range(1500, MAP_SIZE - 1500);
+    const x = r.range(1500, MAP_W - 1500);
+    const y = r.range(1500, MAP_H - 1500);
     if (!terrain.buildableAt(x, y)) continue;
     const [cx, cy] = terrain.cellOf(x, y);
     const slope = terrain.slope[terrain.idx(cx, cy)];
@@ -128,10 +128,9 @@ export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25, nCust = 500
   // ---- Phase C: remaining small towns then settlements, rescored with
   // corridor terms (service towns grow where routes meet).
   const corDist = corridors.corridorDistM, juncDist = corridors.junctionDistM;
-  const n = GRID_N;
   for (const c of cand) {
     const [cx, cy] = terrain.cellOf(c.x, c.y);
-    const i = cy * n + cx;
+    const i = cy * GRID_NX + cx;
     c.score = c.base +
       0.55 * Math.exp(-(corDist[i] ?? 1e9) / 1500) +
       1.1 * Math.exp(-(juncDist[i] ?? 1e9) / 2500);
@@ -158,20 +157,22 @@ export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25, nCust = 500
 // seed the arterial layer; their intersections are "route junctions".
 function buildCorridorSkeleton(terrain, anchors) {
   const router = new GridRouter(terrain);
-  const n = GRID_N;
+  const nx = GRID_NX, ny = GRID_NY;
   const paths = [];
 
   // Exit points: for each non-coast edge, the mainland border cell nearest
-  // the edge midpoint (searched outward from the centre).
+  // the edge midpoint (searched outward from the centre). W/E edges run
+  // along y (length ny), S/N edges along x (length nx).
   const exits = [];
   for (let e = 0; e < 4; e++) {
     if (e === terrain.coastEdge) continue;
-    for (let off = 0; off < n / 2; off++) {
+    const len = e <= 1 ? ny : nx;
+    for (let off = 0; off < len / 2; off++) {
       let found = null;
       for (const s of [-1, 1]) {
-        const k = Math.floor(n / 2) + s * off;
-        if (k < 0 || k >= n) continue;
-        const [cx, cy] = e === 0 ? [0, k] : e === 1 ? [n - 1, k] : e === 2 ? [k, 0] : [k, n - 1];
+        const k = Math.floor(len / 2) + s * off;
+        if (k < 0 || k >= len) continue;
+        const [cx, cy] = e === 0 ? [0, k] : e === 1 ? [nx - 1, k] : e === 2 ? [k, 0] : [k, ny - 1];
         const i = terrain.idx(cx, cy);
         if (terrain.water[i] === 0 && terrain.mainland[i]) { found = terrain.cellCentre(cx, cy); break; }
       }
@@ -223,9 +224,9 @@ const KERNEL_R_SIGMA = 6; // integration / evaluation radius (σ) for the tail
 // finished grid is then normalised so the densest town core sits near 1.0
 // (the underground-cable threshold in network.js reads those units).
 export function buildDensityGrid(terrain, towns, roadDistM, rng, nCust = 50000) {
-  const n = GRID_N;
+  const nx = GRID_NX, ny = GRID_NY;
   const seed = Math.floor(rng.fork("density-noise").float() * 1e9);
-  const grid = new Float32Array(n * n);
+  const grid = new Float32Array(nx * ny);
   let maxD = 0;
 
   // Mass compensation: a town kernel clipped by sea/steep land loses
@@ -236,9 +237,9 @@ export function buildDensityGrid(terrain, towns, roadDistM, rng, nCust = 50000) 
     let I = 0;
     const R = Math.ceil(KERNEL_R_SIGMA * t.sigma / CELL);
     const [tcx, tcy] = terrain.cellOf(t.x, t.y);
-    for (let cy = Math.max(0, tcy - R); cy <= Math.min(n - 1, tcy + R); cy++) {
-      for (let cx = Math.max(0, tcx - R); cx <= Math.min(n - 1, tcx + R); cx++) {
-        const i = cy * n + cx;
+    for (let cy = Math.max(0, tcy - R); cy <= Math.min(ny - 1, tcy + R); cy++) {
+      for (let cx = Math.max(0, tcx - R); cx <= Math.min(nx - 1, tcx + R); cx++) {
+        const i = cy * nx + cx;
         if (!terrain.buildableCell(i)) continue;
         const [x, y] = terrain.cellCentre(cx, cy);
         I += townKernel((x - t.x) ** 2 + (y - t.y) ** 2, t.sigma);
@@ -251,9 +252,9 @@ export function buildDensityGrid(terrain, towns, roadDistM, rng, nCust = 50000) 
 
   // Rural background pass 1: raw roadside + off-road-shoulder values, so
   // the whole rural field can be scaled to its customer remainder.
-  const ruralRaw = new Float32Array(n * n);
+  const ruralRaw = new Float32Array(nx * ny);
   let ruralSum = 0;
-  for (let i = 0; i < n * n; i++) {
+  for (let i = 0; i < nx * ny; i++) {
     if (!terrain.buildableCell(i)) continue;
     // Sparse rural load along roads (decays with road distance) plus an
     // off-road SHOULDER: farms a few km past the end of the road, reached
@@ -270,10 +271,10 @@ export function buildDensityGrid(terrain, towns, roadDistM, rng, nCust = 50000) 
   const townTotal = towns.reduce((s, t) => s + t.cust, 0);
   const ruralScale = Math.max(0, nCust - townTotal) / Math.max(1e-9, ruralSum);
 
-  const nf = 4.2 * MAP_SIZE / 30000; // keep the noise wavelength in km terms
-  for (let cy = 0; cy < n; cy++) {
-    for (let cx = 0; cx < n; cx++) {
-      const i = cy * n + cx;
+  const NOISE_WL = 30000 / 4.2; // metres — size- and aspect-independent
+  for (let cy = 0; cy < ny; cy++) {
+    for (let cx = 0; cx < nx; cx++) {
+      const i = cy * nx + cx;
       if (!terrain.buildableCell(i)) continue;
       const [x, y] = terrain.cellCentre(cx, cy);
       let d = ruralScale * ruralRaw[i];
@@ -282,7 +283,7 @@ export function buildDensityGrid(terrain, towns, roadDistM, rng, nCust = 50000) 
         if (r2 < (KERNEL_R_SIGMA * t.sigma) ** 2) d += t.weight * townKernel(r2, t.sigma);
       }
       d /= peakW; // normalise: densest town core ≈ 1.0 (UG threshold units)
-      d *= 0.55 + 0.9 * fbm01(cx / n * nf, cy / n * nf, seed, 4);
+      d *= 0.55 + 0.9 * fbm01(x / NOISE_WL, y / NOISE_WL, seed, 4);
       grid[i] = d;
       if (d > maxD) maxD = d;
     }

@@ -37,7 +37,7 @@ import {
   FEEDER_MAX_CUST, FEEDER_MAX_KM,
 } from "./membership.js";
 import { CLS_EASEMENT } from "./roads.js";
-import { MAP_SIZE } from "./terrain.js";
+import { MAP_MAX } from "./terrain.js";
 
 // TX farther than this from a road connects by cross-country line easement.
 export const OFFROAD_SNAP_M = 400;
@@ -55,7 +55,7 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   // Never across the sea or a lake; a river span is fine (towers).
   const easeNodes = [];
   for (const tx of txs) {
-    const near = graph.nearestNode(tx.x, tx.y, MAP_SIZE);
+    const near = graph.nearestNode(tx.x, tx.y, MAP_MAX);
     if (near.id === -1) { tx.node = -1; continue; }
     if (near.dist <= OFFROAD_SNAP_M) { tx.node = near.id; continue; }
     let aid = near.id, ad = near.dist;
@@ -308,7 +308,7 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   const allOrder = []; // parent-before-child, contiguous per sub
   const rawFeeders = []; // {sub, rootNode}
 
-  const gridN = terrain.n;
+  const gridN = terrain.nx; // linear cell index stride
   const isUnderground = (a, b) => {
     const mx = (graph.nx[a] + graph.nx[b]) / 2;
     const my = (graph.ny[a] + graph.ny[b]) / 2;
@@ -398,7 +398,7 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
         // a sub whose entire load sits at its own busbar has no branches;
         // hang its TXs off the road-nearest feeder of any neighbour
         const near = graph.nearestNode(graph.nx[tx.node], graph.ny[tx.node],
-          MAP_SIZE, (id) => feederOfNode[id] >= 0);
+          MAP_MAX, (id) => feederOfNode[id] >= 0);
         if (near.id !== -1) f = feeders[feederOfNode[near.id]];
       }
       tx.feeder = f ? f.id : -1;
@@ -600,7 +600,7 @@ function nudgeToCorridor(terrain, graph, cx, cy, existingSubs, loadAt) {
     }
   }
   if (best !== -1) return best;
-  const near = graph.nearestNode(cx, cy, MAP_SIZE,
+  const near = graph.nearestNode(cx, cy, MAP_MAX,
     (id) => !existingSubs.some(s => s.node === id) &&
       graph.adj[id].some(ei => graph.edges[ei].cls !== CLS_EASEMENT));
   return near.id;

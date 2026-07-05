@@ -3,7 +3,7 @@
 // Colours follow the validated reference dataviz palette (fixed categorical
 // order for feeders; reserved status colours for fault states).
 
-import { GRID_N, MAP_SIZE } from "./terrain.js";
+import { GRID_NX, GRID_NY, MAP_W, MAP_H } from "./terrain.js";
 
 export const FEEDER_PALETTE = [
   "#2a78d6", "#1baf7a", "#eda100", "#008300",
@@ -54,10 +54,10 @@ export class Renderer {
 
   fit() {
     const { width, height } = this.canvas;
-    const s = Math.min(width, height) / MAP_SIZE * 0.96;
+    const s = Math.min(width / MAP_W, height / MAP_H) * 0.96;
     this.view.scale = s;
-    this.view.ox = (width - MAP_SIZE * s) / 2;
-    this.view.oy = (height - MAP_SIZE * s) / 2;
+    this.view.ox = (width - MAP_W * s) / 2;
+    this.view.oy = (height - MAP_H * s) / 2;
   }
 
   sx(x) { return x * this.view.scale + this.view.ox; }
@@ -74,12 +74,12 @@ export class Renderer {
   pan(dx, dy) { this.view.ox += dx; this.view.oy += dy; }
 
   _renderTerrainCache(t) {
-    const n = GRID_N;
+    const nx = GRID_NX, ny = GRID_NY;
     const off = document.createElement("canvas");
-    off.width = n; off.height = n;
+    off.width = nx; off.height = ny;
     const c = off.getContext("2d");
-    const img = c.createImageData(n, n);
-    for (let i = 0; i < n * n; i++) {
+    const img = c.createImageData(nx, ny);
+    for (let i = 0; i < nx * ny; i++) {
       let r, g, b;
       if (t.water[i] === 1) {
         const d = Math.min(1, -t.elev[i] * 2.2);
@@ -104,8 +104,8 @@ export class Renderer {
         g = lo[1][1] + (hi[1][1] - lo[1][1]) * f;
         b = lo[1][2] + (hi[1][2] - lo[1][2]) * f;
         // hillshade-lite: darken by slope, brighten NW-facing
-        const cx = i % n, cy = (i / n) | 0;
-        const nwSlope = cx > 0 && cy > 0 ? (t.elev[i] - t.elev[i - n - 1]) : 0;
+        const cx = i % nx, cy = (i / nx) | 0;
+        const nwSlope = cx > 0 && cy > 0 ? (t.elev[i] - t.elev[i - nx - 1]) : 0;
         const shade = 1 - s * 0.35 + nwSlope * 3.2;
         r *= shade; g *= shade; b *= shade;
       }
@@ -119,13 +119,13 @@ export class Renderer {
   }
 
   _renderDensityCache(world) {
-    const n = GRID_N;
+    const nx = GRID_NX, ny = GRID_NY;
     const off = document.createElement("canvas");
-    off.width = n; off.height = n;
+    off.width = nx; off.height = ny;
     const c = off.getContext("2d");
-    const img = c.createImageData(n, n);
+    const img = c.createImageData(nx, ny);
     const { grid, maxD } = world.density;
-    for (let i = 0; i < n * n; i++) {
+    for (let i = 0; i < nx * ny; i++) {
       const v = Math.pow(grid[i] / maxD, 0.45);
       img.data[i * 4] = 42; img.data[i * 4 + 1] = 120; img.data[i * 4 + 2] = 214;
       img.data[i * 4 + 3] = Math.round(v * 190);
@@ -140,16 +140,17 @@ export class Renderer {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     if (!world) return;
     const s = this.view.scale;
-    const px = this.sx(0), py = this.sy(0), sz = MAP_SIZE * s;
+    const px = this.sx(0), py = this.sy(0);
+    const szW = MAP_W * s, szH = MAP_H * s;
 
     if (this.layers.terrain) {
       ctx.imageSmoothingEnabled = true;
-      ctx.drawImage(this._terrainCache, px, py, sz, sz);
+      ctx.drawImage(this._terrainCache, px, py, szW, szH);
     }
-    if (this.layers.density) ctx.drawImage(this._densityCache, px, py, sz, sz);
+    if (this.layers.density) ctx.drawImage(this._densityCache, px, py, szW, szH);
     if (this.layers.heat && this._heatCache) {
       ctx.imageSmoothingEnabled = false; // crisp cells for the heat layer
-      ctx.drawImage(this._heatCache, px, py, sz, sz);
+      ctx.drawImage(this._heatCache, px, py, szW, szH);
       ctx.imageSmoothingEnabled = true;
     }
     if (this.layers.roads) this._drawRoads();
@@ -399,22 +400,22 @@ export class Renderer {
   // Heat layer: per-cell max of the serving feeder's normalised
   // customer-minutes (sequential blue ramp — dark = worst).
   updateHeat(world, heatByFeeder) {
-    const n = GRID_N;
-    const vals = new Float32Array(n * n).fill(-1);
+    const nx = GRID_NX, ny = GRID_NY;
+    const vals = new Float32Array(nx * ny).fill(-1);
     for (const c of world.customers) {
       const tx = world.net.txs[c.tx];
       if (!tx || tx.feeder < 0) continue;
       const v = heatByFeeder.get(tx.feeder) ?? 0;
       const [cx, cy] = world.terrain.cellOf(c.x, c.y);
-      const i = cy * n + cx;
+      const i = cy * nx + cx;
       if (v > vals[i]) vals[i] = v;
     }
     const off = document.createElement("canvas");
-    off.width = n; off.height = n;
+    off.width = nx; off.height = ny;
     const ctx2 = off.getContext("2d");
-    const img = ctx2.createImageData(n, n);
+    const img = ctx2.createImageData(nx, ny);
     const c0 = [205, 226, 251], c1 = [13, 54, 107]; // palette blue 100→700
-    for (let i = 0; i < n * n; i++) {
+    for (let i = 0; i < nx * ny; i++) {
       const v = vals[i];
       if (v < 0) continue;
       img.data[i * 4] = c0[0] + (c1[0] - c0[0]) * v;

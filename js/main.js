@@ -1,7 +1,7 @@
 // main.js — pipeline orchestration + UI wiring + headless selftest mode.
 
 import { RNG } from "./rng.js";
-import { Terrain, MAP_SIZE } from "./terrain.js";
+import { Terrain } from "./terrain.js";
 import { seedTowns, buildDensityGrid } from "./density.js";
 import { sampleCustomers } from "./customers.js";
 import { buildRoads, roadDistanceGrid } from "./roads.js";
@@ -427,7 +427,7 @@ function townCoastDist(world) {
   const t = world.terrain;
   const d = world.towns.map(tn => {
     const [cx, cy] = t.cellOf(tn.x, tn.y);
-    return t._coastDist(cx, cy) * MAP_SIZE / 1000; // normalised → km across the map
+    return t._coastDist(cx, cy) * t.coastAxisM() / 1000; // normalised → km inland
   });
   return +(d.reduce((a, b) => a + b, 0) / d.length).toFixed(1);
 }
