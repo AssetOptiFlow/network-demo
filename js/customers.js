@@ -9,7 +9,7 @@
 //  - Customers only ever land on buildable cells of the main landmass
 //    (never in water, never on slopes ≥ 0.35 m/m).
 
-import { CELL, GRID_N } from "./terrain.js";
+import { CELL, GRID_N, MAP_SIZE } from "./terrain.js";
 
 export function sampleCustomers(terrain, density, graph, nCust, rng) {
   const n = GRID_N;
@@ -40,7 +40,7 @@ export function sampleCustomers(terrain, density, graph, nCust, rng) {
   // Snap each customer to its nearest road node (service point).
   let maxSnap = 0, sumSnap = 0;
   for (const c of customers) {
-    const near = graph.nearestNode(c.x, c.y, 30000);
+    const near = graph.nearestNode(c.x, c.y, MAP_SIZE);
     c.node = near.id;
     maxSnap = Math.max(maxSnap, near.dist);
     sumSnap += near.dist;

@@ -7,16 +7,22 @@
 //    (then 1.3x) — so the first crossing "builds" a bridge and later roads
 //    reuse it. Roads cross the river ONLY at these generated bridges.
 //  - Urban streets: per-town rotated lattice (130–165 m spacing) kept where
-//    density is high enough; every 4th line is a collector. Grid-ish in
-//    town, absent in the country.
-//  - Rural roads: customer clusters (800 m bins) more than ~350 m from a
-//    road get a local road spur routed by the same terrain-aware A*.
+//    density is high enough, but ORGANIC rather than stamped: every point
+//    wobbles (more towards the edge), fraying starts near the core, and a
+//    few streets drop out entirely (dead ends, broken blocks). Every 4th
+//    surviving line is a collector.
+//  - Rural roads: spurs off arterials into flat country every ~1–1.6 km
+//    (many fork), then nearby dead ends are LINKED into a sparse web of
+//    back roads, so the countryside reads as through-routes, not stubs.
+//  - Line easements (CLS_EASEMENT) are NOT roads: straight cross-country
+//    power spans added by the network layer for remote transformers. They
+//    are excluded from road drawing and from the bridges-only river rule.
 //  - Any disconnected road component is repaired by A* — the finished
 //    graph is asserted fully connected.
 
 import { CELL, GRID_N, MAP_SIZE, bfsDistanceM } from "./terrain.js";
 
-export const CLS_ARTERIAL = 0, CLS_COLLECTOR = 1, CLS_LOCAL = 2;
+export const CLS_ARTERIAL = 0, CLS_COLLECTOR = 1, CLS_LOCAL = 2, CLS_EASEMENT = 3;
 
 // ---------------------------------------------------------------- helpers
 
@@ -303,9 +309,24 @@ export function buildRoads(terrain, towns, corridors, rng) {
   }
   const m = towns.length;
   if (m > 1) {
+    // A link touching a rural settlement is a COLLECTOR (a sealed country
+    // road), links between real towns are ARTERIALS.
+    const linkCls = (i, j) =>
+      (towns[i].tier === 2 || towns[j].tier === 2) ? CLS_COLLECTOR : CLS_ARTERIAL;
+    const linked = new Set();
+    const routeLink = (i, j) => {
+      const key = i < j ? i * 1024 + j : j * 1024 + i;
+      if (linked.has(key)) return;
+      linked.add(key);
+      const cells = router.route(towns[i].x, towns[i].y, towns[j].x, towns[j].y);
+      if (cells) {
+        addRoutedPath(cells, linkCls(i, j));
+        arterialCellPaths.push(cells);
+      }
+    };
+    // MST keeps every town and settlement connected…
     const inTree = new Uint8Array(m);
     inTree[0] = 1;
-    const links = [];
     for (let k = 1; k < m; k++) {
       let bi = -1, bj = -1, bd = Infinity;
       for (let i = 0; i < m; i++) {
@@ -317,22 +338,20 @@ export function buildRoads(terrain, towns, corridors, rng) {
         }
       }
       inTree[bj] = 1;
-      links.push([bi, bj]);
+      routeLink(bi, bj);
     }
-    let extra = null, bd = Infinity;
+    // …then k-NEAREST links add loops: every town and settlement also
+    // routes to its 2 nearest neighbours (within 45 km), so the inter-town
+    // network is a web with alternative routes, not a bare tree.
     for (let i = 0; i < m; i++) {
-      for (let j = i + 1; j < m; j++) {
-        if (links.some(([a, b]) => (a === i && b === j) || (a === j && b === i))) continue;
-        const d = Math.hypot(towns[i].x - towns[j].x, towns[i].y - towns[j].y);
-        if (d < bd && d < 14000) { bd = d; extra = [i, j]; }
+      const near = [];
+      for (let j = 0; j < m; j++) {
+        if (j === i) continue;
+        near.push({ j, d: Math.hypot(towns[j].x - towns[i].x, towns[j].y - towns[i].y) });
       }
-    }
-    if (extra) links.push(extra);
-    for (const [i, j] of links) {
-      const cells = router.route(towns[i].x, towns[i].y, towns[j].x, towns[j].y);
-      if (cells) {
-        addRoutedPath(cells, CLS_ARTERIAL);
-        arterialCellPaths.push(cells);
+      near.sort((a, b) => a.d - b.d);
+      for (const { j, d } of near.slice(0, 2)) {
+        if (d < 45000) routeLink(i, j);
       }
     }
   }
@@ -354,11 +373,13 @@ export function buildRoads(terrain, towns, corridors, rng) {
         let x = t.x + (i * ux - j * uy) * s;
         let y = t.y + (i * uy + j * ux) * s;
         const rad = Math.hypot(x - t.x, y - t.y);
-        // fray: outer blocks drop out and wobble; the core stays regular
-        const fray = Math.max(0, (rad / R - 0.45) / 0.55);
-        if (rT.float() < 0.55 * fray * fray) continue;
-        x += (rT.float() - 0.5) * s * 0.7 * fray;
-        y += (rT.float() - 0.5) * s * 0.7 * fray;
+        // fray: starts near the core and strengthens outward, so even the
+        // centre of town is only grid-ISH, not a stamped lattice
+        const fray = Math.max(0, (rad / R - 0.25) / 0.75);
+        if (rT.float() < 0.65 * fray * fray) continue;
+        const wob = 0.28 + 0.62 * fray; // organic wobble everywhere
+        x += (rT.float() - 0.5) * s * wob;
+        y += (rT.float() - 0.5) * s * wob;
         if (x < 0 || y < 0 || x > MAP_SIZE || y > MAP_SIZE) continue;
         if (!terrain.buildableAt(x, y)) continue;
         const gauss = Math.exp(-rad * rad / (2 * t.sigma * t.sigma));
@@ -371,6 +392,7 @@ export function buildRoads(terrain, towns, corridors, rng) {
       for (const [di, dj] of [[1, 0], [0, 1]]) {
         const nb = keep.get((i + di) + "," + (j + dj));
         if (!nb) continue;
+        if (rT.float() < 0.07) continue; // dead ends and broken blocks
         if (terrain.segmentCrossesWater(x, y, nb[0], nb[1])) continue;
         const cls = (i % 4 === 0 && dj === 1) || (j % 4 === 0 && di === 1)
           ? CLS_COLLECTOR : CLS_LOCAL;
@@ -381,21 +403,21 @@ export function buildRoads(terrain, towns, corridors, rng) {
 
   // ---- 3. Rural roads: spurs branching off arterials into flat country
   // (terrain-driven — rural LOAD follows these roads later, not vice
-  // versa). Spur seeds every ~2 km along arterials; some spurs fork.
+  // versa). Spur seeds every ~1–1.6 km along arterials; many fork.
   const rSpur = rng.fork("spurs");
   const spurTargets = [];
   for (const cells of arterialCellPaths) {
     let acc = 0;
     for (let i = 1; i < cells.length; i++) {
       acc += CELL;
-      if (acc < 1600 + rSpur.float() * 900) continue;
+      if (acc < 1000 + rSpur.float() * 600) continue;
       acc = 0;
-      if (rSpur.float() < 0.45) continue;
+      if (rSpur.float() < 0.25) continue;
       const [px, py] = terrain.cellCentre(cells[i] % n, (cells[i] / n) | 0);
       const [qx, qy] = terrain.cellCentre(cells[i - 1] % n, (cells[i - 1] / n) | 0);
       const dl = Math.hypot(px - qx, py - qy) || 1;
       const side = rSpur.float() < 0.5 ? 1 : -1;
-      const len = rSpur.range(900, 3200);
+      const len = rSpur.range(1100, 5200);
       const tx = px + (-(py - qy) / dl) * len * side + (rSpur.float() - 0.5) * 900;
       const ty = py + ((px - qx) / dl) * len * side + (rSpur.float() - 0.5) * 900;
       if (tx < 400 || ty < 400 || tx > MAP_SIZE - 400 || ty > MAP_SIZE - 400) continue;
@@ -407,14 +429,38 @@ export function buildRoads(terrain, towns, corridors, rng) {
       }
     }
   }
+  const linkEnds = spurTargets.slice(); // spur ends + fork ends, for the web pass
   for (const [sx, sy] of spurTargets) {
-    if (rSpur.float() > 0.3) continue; // some spurs fork once more
-    const tx = sx + (rSpur.float() - 0.5) * 3600;
-    const ty = sy + (rSpur.float() - 0.5) * 3600;
+    if (rSpur.float() > 0.55) continue; // many spurs fork once more
+    const tx = sx + (rSpur.float() - 0.5) * 5200;
+    const ty = sy + (rSpur.float() - 0.5) * 5200;
     if (tx < 400 || ty < 400 || tx > MAP_SIZE - 400 || ty > MAP_SIZE - 400) continue;
     if (!terrain.buildableAt(tx, ty) || terrain.slopeAt(tx, ty) > 0.3) continue;
     const cellsSpur = router.route(sx, sy, tx, ty);
-    if (cellsSpur) addRoutedPath(cellsSpur, CLS_LOCAL);
+    if (cellsSpur) {
+      addRoutedPath(cellsSpur, CLS_LOCAL);
+      linkEnds.push([tx, ty]);
+    }
+  }
+
+  // ---- 3b. Rural web: join nearby dead ends into through routes, so the
+  // back country reads as a sparse road web rather than a comb of stubs.
+  // Straight-line river hits are skipped — country lanes don't casually
+  // build bridges (arterials still do, at 28x).
+  for (let i = 0; i < linkEnds.length; i++) {
+    if (rSpur.float() > 0.55) continue;
+    const [ax, ay] = linkEnds[i];
+    let bj = -1, bd = Infinity;
+    for (let j = 0; j < linkEnds.length; j++) {
+      if (j === i) continue;
+      const d = Math.hypot(linkEnds[j][0] - ax, linkEnds[j][1] - ay);
+      if (d > 800 && d < bd) { bd = d; bj = j; } // >800 m: skip trivial stubs
+    }
+    if (bj === -1 || bd > 6500) continue;
+    const [bx, by] = linkEnds[bj];
+    if (terrain.segmentTouchesRiver(ax, ay, bx, by)) continue;
+    const cellsLink = router.route(ax, ay, bx, by);
+    if (cellsLink) addRoutedPath(cellsLink, CLS_LOCAL);
   }
 
   // ---- 4. Connectivity repair (assert-backed, not assumed)
@@ -494,7 +540,9 @@ export function components(graph) {
 
 function repairConnectivity(graph, terrain, router) {
   let merges = 0;
-  for (let iter = 0; iter < 80; iter++) {
+  // generous cap: street dropout + fraying on the 100 km map can leave
+  // many small fragments, each merged one iteration at a time
+  for (let iter = 0; iter < 400; iter++) {
     const { comp, nComp } = components(graph);
     if (nComp <= 1) return { merges, connected: true };
     // sizes

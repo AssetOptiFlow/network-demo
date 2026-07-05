@@ -1,40 +1,56 @@
 // reliability.js — SAIDI model, greedy device placement (sectionalisers +
-// reclosers), fault playback classification, road-vs-line comparison.
+// reclosers), BACKFEED via normally-open ties, fault playback
+// classification, road-vs-line comparison.
 //
 // ASSUMPTIONS (all also listed in the UI):
-//  - Uniform fault rate λ = 0.10 faults / km / year on every HV segment
-//    (no weather, vegetation or asset-age variation). Debug mode can
-//    double λ on one branch to show the greedy is rate-weighted.
+//  - Separate uniform fault rates for overhead line and underground cable
+//    (cables fault far less often; the flat 120 min repair is kept for
+//    both, which flatters cable repairs — labelled). Adjustable in the UI.
+//    Debug mode can double λ on one branch to show scoring is rate-weighted.
 //  - Fault duration for customers NOT restorable by switching:
-//    crew travel from the zone sub (the crew depot) along roads at
-//    50 km/h to the faulted segment midpoint, + flat 120 min repair.
-//  - SECTIONALISERS (load-break switches, no protection role): opening the
-//    deepest switch upstream of the fault and reclosing the tripped device
-//    restores everyone else in the tripped zone after a flat 45 min.
-//    (Flat time keeps greedy placement provably monotone.)
+//    crew travel from the zone sub (the crew depot) along the line route
+//    at 50 km/h to the faulted segment midpoint, + flat 120 min repair.
+//  - SECTIONALISERS (load-break switches, no protection role): restorable
+//    customers come back after a flat 45 min of switching.
 //  - RECLOSERS (protection devices): a fault downstream of a recloser is
 //    cleared BY the recloser — customers upstream of it see no sustained
 //    interruption at all (0 min). Momentary interruptions (SAIFI/MAIFI)
-//    are NOT modelled. Sectionalising still works inside the tripped zone.
-//  - One device per section; radial only — no backfeed, so customers
-//    downstream of the opened device wait for the full repair regardless.
+//    are NOT modelled. A recloser also acts as an isolator for backfeed.
+//  - BACKFEED TIES: adjacent feeders share one normally-open tie point
+//    (built in network.js from the shortest unused-road corridor joining
+//    them, ≤ 2 km). For a fault, every maximal device-bounded subtree in
+//    the wait set that reaches a tie and does NOT contain the fault is
+//    re-energised from the neighbouring feeder at the same flat 45 min —
+//    opening the bounding device isolates the subtree from its own feeder
+//    no matter where the fault sits, so LATERAL branches backfeed too.
+//    Tie capacity is UNLIMITED and the neighbour is assumed healthy —
+//    labelled simplifications.
+//  - One device per section. The stretch between the fault and the nearest
+//    isolators (up- and downstream) still waits out the full repair.
+//  - NO express runs: every feeder roots AT its sub busbar (network.js
+//    spawns extra subs rather than running parallel circuits), so there is
+//    no un-switchable express floor in SAIDI.
 //  - Device-free baseline: one breaker at the sub, no fuses.
 //
-// Device model per fault on edge e:
+// Device model per fault on edge e (evaluated EXACTLY, per feeder):
 //   zone  = subtree of the deepest recloser on path(root → e), else feeder
-//   wait  = subtree of the deepest sectionaliser BELOW that recloser on the
-//           path (else = zone): these customers wait travel + 120 min
-//   zone − wait      → restored at 45 min
-//   feeder − zone    → never interrupted
+//   NW    = subtree of the deepest device below that recloser on the path
+//           (else = zone): tripped and not upstream-restorable
+//   B(e)  = customers of maximal device-bounded tie-reaching subtrees in
+//           the wait set that do not contain e (laterals passed on the way
+//           down + subtrees below e) — backfed at 45 min
+//   zone − NW    → restored at 45 min (upstream switching)
+//   B(e)         → restored at 45 min (downstream backfeed)
+//   NW − B(e)    → wait travel + 120 min
+//   feeder − zone → never interrupted
+// The greedy scores each candidate by re-running the (cheap) per-feeder
+// evaluation with the trial device added — exact, so it stays provably
+// monotone even with backfeed in play.
 
 export const REPAIR_MIN = 120;
 export const TRAVEL_KMH = 50;
 export const SWITCH_MIN = 45;
 
-// ASSUMPTION: separate uniform fault rates for overhead line and
-// underground cable (cables fault far less often; the flat 120 min repair
-// is kept for both, which flatters cable repairs — labelled in UI).
-// Adjustable at runtime via the UI.
 export const faultRates = { oh: 0.08, ug: 0.02 }; // faults / km / yr
 
 export function setFaultRates(oh, ug) {
@@ -54,15 +70,6 @@ function edgeMass(te, rateMul) {
   return base * (te.lenM / 1000) * (rateMul ? rateMul(te) : 1);
 }
 
-// Express run (sub → feeder head, a parallel circuit on the same roads):
-// faults there black out the WHOLE feeder and no in-feeder device helps,
-// so it contributes a constant, un-switchable customer-minute floor.
-function expressCustMin(f) {
-  const m = faultRates.oh * f.expressOhKm + faultRates.ug * f.expressUgKm;
-  if (m <= 0) return 0;
-  return m * (travelMin(f.expressMidM) + REPAIR_MIN) * f.customers;
-}
-
 // Build per-feeder child lists once.
 export function feederStructure(net) {
   const children = new Map(); // node -> [treeEdge ids of child edges]
@@ -73,57 +80,133 @@ export function feederStructure(net) {
   return children;
 }
 
+// Parent-before-child tree-edge order for one feeder (cached on the net).
+function feederOrder(net, f) {
+  if (!net._orders) net._orders = new Map();
+  let order = net._orders.get(f.id);
+  if (order) return order;
+  const children = net._children ?? (net._children = feederStructure(net));
+  order = [];
+  const rootTe = net.treeEdgeOfNode[f.rootNode];
+  if (rootTe !== -1) {
+    const stack = [rootTe];
+    while (stack.length) {
+      const teId = stack.pop();
+      order.push(teId);
+      const kids = children.get(net.treeEdges[teId].node);
+      if (kids) for (const k of kids) {
+        if (net.treeEdges[k].feeder === f.id) stack.push(k);
+      }
+    }
+  }
+  net._orders.set(f.id, order);
+  return order;
+}
+
+// Exact expected cust·min/yr for ONE feeder under a device set, optionally
+// with one extra TRIAL device — candidate scoring re-runs this, so gains
+// are exact rather than closed-form-approximate.
+function feederCustMin(net, f, devices, rateMul = null, extraTe = -1, extraKind = null) {
+  const children = net._children ?? (net._children = feederStructure(net));
+  const order = feederOrder(net, f);
+  let custMin = 0; // feeders root AT the busbar — no express-run floor
+  if (!order.length) return custMin;
+  const isSw = (id) => devices.switches.has(id) || (extraKind === "switch" && id === extraTe);
+  const isRc = (id) => devices.reclosers.has(id) || (extraKind === "recloser" && id === extraTe);
+  const tieNodes = net.tieNodesByFeeder ? net.tieNodesByFeeder[f.id] : null;
+
+  // Bottom-up: tieIn (does this subtree reach a tie point?) and R — the
+  // backfeedable customers within this edge's subtree: the union of
+  // maximal device-bounded child subtrees that reach a tie. contrib(k) is
+  // one child branch's share of that.
+  const tieIn = new Map(), R = new Map();
+  const contrib = (k) => ((isSw(k) || isRc(k)) && tieIn.get(k))
+    ? net.subtreeCust[net.treeEdges[k].node]
+    : R.get(k);
+  for (let i = order.length - 1; i >= 0; i--) {
+    const teId = order[i], te = net.treeEdges[teId];
+    let t = tieNodes ? tieNodes.has(te.node) : false;
+    let r = 0;
+    const kids = children.get(te.node);
+    if (kids) for (const k of kids) {
+      if (net.treeEdges[k].feeder !== f.id) continue;
+      if (tieIn.get(k)) t = true;
+      r += contrib(k);
+    }
+    tieIn.set(teId, t);
+    R.set(teId, r);
+  }
+
+  // Top-down: zone/wait context per fault edge, accumulating cust·min.
+  // A = backfeedable customers on LATERAL branches passed on the way down
+  // from the wait-set root: opening those branches' devices isolates them
+  // from the feeder no matter where the fault is, so they backfeed for
+  // this fault too. A resets at every device (everything above a deeper
+  // device is upstream-restored the ordinary way instead).
+  const stack = [[order[0], f.customers, f.customers, 0]];
+  while (stack.length) {
+    const [teId, NZin, NWin, Ain] = stack.pop();
+    const te = net.treeEdges[teId];
+    let NZ = NZin, NW = NWin, A = Ain;
+    if (isRc(teId)) { NZ = NW = net.subtreeCust[te.node]; A = 0; }
+    else if (isSw(teId)) { NW = net.subtreeCust[te.node]; A = 0; }
+    const m = edgeMass(te, rateMul);
+    const D = faultDurMin(te);
+    // backfed at 45 min: laterals above (A) + device-bounded tie subtrees
+    // below the fault (R)
+    const B = Math.min(A + R.get(teId), NW);
+    custMin += m * (D * (NW - B) + SWITCH_MIN * (NZ - NW + B));
+    const kids = children.get(te.node);
+    if (kids) for (const k of kids) {
+      if (net.treeEdges[k].feeder !== f.id) continue;
+      // descending into k: every OTHER branch at this junction becomes a
+      // lateral — R(teId) minus k's own contribution
+      stack.push([k, NZ, NW, A + R.get(teId) - contrib(k)]);
+    }
+  }
+  return custMin;
+}
+
 // SAIDI with given devices {switches, reclosers} (Sets of treeEdge ids).
 // Returns { perFeeder: [{saidi, custMin}], overall } in minutes/year.
 export function computeSaidi(net, devices, rateMul = null) {
-  const children = net._children ?? (net._children = feederStructure(net));
-  const { switches, reclosers } = devices;
   const perFeeder = [];
   let totalCustMin = 0, totalCust = 0;
   for (const f of net.feeders) {
-    const Nf = f.customers;
-    let custMin = expressCustMin(f);
-    // DFS carrying (NZ = tripped-zone population, NW = full-wait population).
-    const stack = [[net.treeEdgeOfNode[f.rootNode], Nf, Nf]];
-    while (stack.length) {
-      const [teId, NZin, NWin] = stack.pop();
-      const te = net.treeEdges[teId];
-      let NZ = NZin, NW = NWin;
-      if (reclosers.has(teId)) NZ = NW = net.subtreeCust[te.node];
-      else if (switches.has(teId)) NW = net.subtreeCust[te.node];
-      const m = edgeMass(te, rateMul);
-      const D = faultDurMin(te);
-      custMin += m * (D * NW + SWITCH_MIN * (NZ - NW));
-      const kids = children.get(te.node);
-      if (kids) for (const k of kids) {
-        if (net.treeEdges[k].feeder === f.id) stack.push([k, NZ, NW]);
-      }
-    }
-    perFeeder.push({ feeder: f.id, custMin, saidi: Nf > 0 ? custMin / Nf : 0 });
+    const custMin = feederCustMin(net, f, devices, rateMul);
+    perFeeder.push({ feeder: f.id, custMin, saidi: f.customers > 0 ? custMin / f.customers : 0 });
     totalCustMin += custMin;
-    totalCust += Nf;
+    totalCust += f.customers;
   }
   return { perFeeder, overall: totalCust > 0 ? totalCustMin / totalCust : 0, totalCust };
 }
 
 // All positive-benefit candidate placements for one device kind, sorted
-// descending. Closed-form marginal customer-minute savings:
-//   switch at c:   (NW − N_sub(c)) · Σ_A m·(D − 45)
-//   recloser at c: (NW − N_sub(c)) · Σ_A m·D
-//                  + 45·(NZ − NW) · Σ_A m  +  45·(NZ − N_sub(c)) · Σ_B m
-// where A = edges of subtree(c) with no device between c and e (they share
-// c's wait context NW), and B = edges below a deeper SWITCH but no deeper
-// recloser (their wait population is unchanged; only the zone shrinks).
-// Subtrees below a deeper RECLOSER are unaffected entirely.
+// descending. Each candidate's gain is EXACT: the feeder's cust·min is
+// re-evaluated with the trial device added (benefits are feeder-local, so
+// only that feeder needs recomputing).
 export function allCandidates(net, devices, kind, rateMul = null) {
   const children = net._children ?? (net._children = feederStructure(net));
   const { switches, reclosers } = devices;
   const out = [];
   for (const f of net.feeders) {
-    const rootTe = net.treeEdgeOfNode[f.rootNode];
-    const order = [];
-    const NZof = new Map(), NWof = new Map(); // context just ABOVE each edge
-    const stack = [[rootTe, f.customers, f.customers]];
+    const order = feederOrder(net, f);
+    if (!order.length) continue;
+    const base = feederCustMin(net, f, devices, rateMul);
+    // context pass under the CURRENT devices, for the custRestored report
+    const tieNodes = net.tieNodesByFeeder ? net.tieNodesByFeeder[f.id] : null;
+    const tieIn = new Map();
+    for (let i = order.length - 1; i >= 0; i--) {
+      const teId = order[i], te = net.treeEdges[teId];
+      let t = tieNodes ? tieNodes.has(te.node) : false;
+      const kids = children.get(te.node);
+      if (kids) for (const k of kids) {
+        if (net.treeEdges[k].feeder === f.id && tieIn.get(k)) t = true;
+      }
+      tieIn.set(teId, t);
+    }
+    const NZof = new Map(), NWof = new Map();
+    const stack = [[order[0], f.customers, f.customers]];
     while (stack.length) {
       const [teId, NZin, NWin] = stack.pop();
       const te = net.treeEdges[teId];
@@ -131,42 +214,21 @@ export function allCandidates(net, devices, kind, rateMul = null) {
       let NZ = NZin, NW = NWin;
       if (reclosers.has(teId)) NZ = NW = net.subtreeCust[te.node];
       else if (switches.has(teId)) NW = net.subtreeCust[te.node];
-      order.push(teId);
       const kids = children.get(te.node);
       if (kids) for (const k of kids) {
         if (net.treeEdges[k].feeder === f.id) stack.push([k, NZ, NW]);
       }
     }
-    // Post-order truncated sums (order[] is parent-before-child).
-    const SAm = new Map(), SAmD = new Map(), SRm = new Map();
-    for (let i = order.length - 1; i >= 0; i--) {
-      const teId = order[i];
-      const te = net.treeEdges[teId];
-      const m = edgeMass(te, rateMul), D = faultDurMin(te);
-      let sam = m, samd = m * D, srm = m;
-      const kids = children.get(te.node);
-      if (kids) for (const k of kids) {
-        if (net.treeEdges[k].feeder !== f.id) continue;
-        if (!reclosers.has(k)) {
-          srm += SRm.get(k);
-          if (!switches.has(k)) { sam += SAm.get(k); samd += SAmD.get(k); }
-        }
-      }
-      SAm.set(teId, sam); SAmD.set(teId, samd); SRm.set(teId, srm);
-    }
     for (const teId of order) {
       if (switches.has(teId) || reclosers.has(teId)) continue;
-      const te = net.treeEdges[teId];
-      const Nsub = net.subtreeCust[te.node];
-      const NW = NWof.get(teId), NZ = NZof.get(teId);
-      const gain = kind === "switch"
-        ? (NW - Nsub) * (SAmD.get(teId) - SWITCH_MIN * SAm.get(teId))
-        : (NW - Nsub) * SAmD.get(teId)
-          + SWITCH_MIN * (NZ - NW) * SAm.get(teId)
-          + SWITCH_MIN * (NZ - Nsub) * (SRm.get(teId) - SAm.get(teId));
+      const gain = base - feederCustMin(net, f, devices, rateMul, teId, kind);
       if (gain > 1e-9) {
+        const te = net.treeEdges[teId];
+        const Nsub = net.subtreeCust[te.node];
+        const upstream = (kind === "switch" ? NWof.get(teId) : NZof.get(teId)) - Nsub;
+        const backfed = tieIn.get(teId) ? Nsub : 0;
         out.push({ teId, gain, kind, feeder: f.id, node: te.node,
-          custRestored: (kind === "switch" ? NW : NZ) - Nsub });
+          custRestored: upstream + backfed });
       }
     }
   }
@@ -179,7 +241,8 @@ export function bestCandidate(net, devices, kind, rateMul = null) {
 }
 
 // Greedy placement of `count` devices of one kind. Returns log entries;
-// asserts the running SAIDI is monotone non-increasing.
+// asserts the running SAIDI is monotone non-increasing (it must be — every
+// accepted candidate's gain is an exact recomputation).
 export function greedyPlace(net, count, kind, existing = null, rateMul = null) {
   const devices = {
     switches: new Set(existing?.switches ?? []),
@@ -228,11 +291,10 @@ export function subtreeEdges(net, teId) {
 }
 
 // ---- debug mode: double one branch's fault rate; the greedy's first pick
-// should move — proving the score is rate-weighted. The boosted branch is
-// the subtree of the strongest candidate whose doubling actually moves the
-// global first pick; doubling a branch exactly doubles that candidate's own
-// benefit, so scanning the top candidates finds a mover unless the baseline
-// pick dominates everything by more than 2x (then reported honestly).
+// should move — proving the score is rate-weighted. With backfeed ties part
+// of a candidate's benefit comes from faults UPSTREAM of the boosted branch
+// (unchanged by the boost), so the boosted candidate's gain rises by a
+// factor in (1, 2] rather than exactly 2 — the check accepts any clear rise.
 export function debugRateExperiment(net) {
   const ranked = allCandidates(net, emptyDevices(), "switch");
   if (!ranked.length) return { supported: false, reason: "no candidates" };
@@ -256,21 +318,22 @@ export function debugRateExperiment(net) {
   }
   if (!chosen) return { supported: false, reason: "single-candidate network" };
   // Whether or not the pick moved, the boosted branch's own benefit must
-  // have EXACTLY doubled — the direct proof the score is rate-weighted.
+  // have clearly RISEN — the direct proof the score is rate-weighted.
   // (A dominant baseline pick can survive any single doubling; that is a
   // property of the network, not of the scoring.)
   const after = allCandidates(net, emptyDevices(), "switch", chosen.rateMul)
     .find(c => c.teId === chosen.boostEdge);
   const boostGainDebug = after ? after.gain : 0;
-  const rateWeighted = chosen.moved ||
-    Math.abs(boostGainDebug - 2 * chosen.boostGain) <= 1e-6 * chosen.boostGain;
-  console.assert(rateWeighted, "boosted branch benefit did not double");
+  const ratio = chosen.boostGain > 0 ? boostGainDebug / chosen.boostGain : 0;
+  const rateWeighted = chosen.moved || ratio > 1.1;
+  console.assert(rateWeighted, "boosted branch benefit did not rise with its fault rate");
   return {
     supported: true,
     boostEdge: chosen.boostEdge,
     boostNode: chosen.boostNode,
     boostGain: chosen.boostGain,
     boostGainDebug,
+    boostRatio: ratio,
     rateWeighted,
     boostFeeder: chosen.boostFeeder,
     branch: chosen.branch,
@@ -283,11 +346,14 @@ export function debugRateExperiment(net) {
 
 // ---- fault playback classification -------------------------------------
 // Walk up from the faulted edge: the first recloser found bounds the
-// tripped zone; the first switch found BEFORE that recloser bounds the
-// full-wait set. Conservation (out + isolatable = affected = zone;
+// tripped zone; the first device found BEFORE that recloser bounds the
+// full-wait set. Below the fault, maximal device-bounded subtrees that
+// reach a tie are BACKFED from the neighbouring feeder at 45 min.
+// Conservation (out + isolatable + backfed = affected = zone;
 // zone + unaffected = feeder) is checked, not assumed.
 export function faultScenario(net, devices, teId) {
   const { switches, reclosers } = devices;
+  const children = net._children ?? (net._children = feederStructure(net));
   const te = net.treeEdges[teId];
   const f = net.feeders.find(f => f.id === te.feeder);
   let switchTe = -1, recloserTe = -1;
@@ -299,24 +365,80 @@ export function faultScenario(net, devices, teId) {
   const rootTe = net.treeEdgeOfNode[f.rootNode];
   const zoneEdges = subtreeEdges(net, recloserTe !== -1 ? recloserTe : rootTe);
   const waitTe = switchTe !== -1 ? switchTe : recloserTe;
-  const outEdges = waitTe !== -1 ? subtreeEdges(net, waitTe) : zoneEdges;
+  const outEdges = waitTe !== -1 ? subtreeEdges(net, waitTe) : new Set(zoneEdges);
+
+  // Backfeed: every maximal device-bounded subtree inside the wait set
+  // that reaches a tie and does NOT contain the fault comes back at
+  // SWITCH_MIN from the neighbour — laterals passed on the way down from
+  // the wait-set root as well as subtrees below the fault (opening the
+  // bounding device isolates the subtree from the feeder no matter where
+  // the fault sits).
+  const tieNodes = net.tieNodesByFeeder ? net.tieNodesByFeeder[f.id] : null;
+  const isDev = (id) => switches.has(id) || reclosers.has(id);
+  const subtreeHasTie = (rootId) => {
+    if (!tieNodes || tieNodes.size === 0) return false;
+    const stack = [rootId];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (tieNodes.has(net.treeEdges[cur].node)) return true;
+      const kids = children.get(net.treeEdges[cur].node);
+      if (kids) for (const k of kids) {
+        if (net.treeEdges[k].feeder === f.id) stack.push(k);
+      }
+    }
+    return false;
+  };
+  const tieEdges = new Set();
+  let custTie = 0;
+  const collectStack = [];
+  const collectFrom = (k) => { collectStack.push(k); };
+  // walk the path wait-set root → fault edge; every off-path branch at
+  // every junction (and everything below the fault) is a candidate
+  const startTe = waitTe !== -1 ? waitTe : rootTe;
+  const onPath = new Set();
+  for (let cur = teId; cur !== -1; cur = parentTreeEdge(net, cur)) {
+    if (net.treeEdges[cur].feeder !== f.id) break;
+    onPath.add(cur);
+    if (cur === startTe) break;
+  }
+  for (const p of onPath) {
+    const kids = children.get(net.treeEdges[p].node);
+    if (kids) for (const k of kids) {
+      if (net.treeEdges[k].feeder !== f.id || onPath.has(k)) continue;
+      collectFrom(k);
+    }
+  }
+  while (collectStack.length) {
+    const k = collectStack.pop();
+    if (isDev(k) && subtreeHasTie(k)) {
+      for (const id of subtreeEdges(net, k)) tieEdges.add(id);
+      custTie += net.subtreeCust[net.treeEdges[k].node];
+      continue;
+    }
+    const kids = children.get(net.treeEdges[k].node);
+    if (kids) for (const kk of kids) {
+      if (net.treeEdges[kk].feeder === f.id) collectStack.push(kk);
+    }
+  }
+  for (const id of tieEdges) outEdges.delete(id);
+
   const custZone = recloserTe !== -1
     ? net.subtreeCust[net.treeEdges[recloserTe].node] : f.customers;
-  const custOut = waitTe !== -1
-    ? net.subtreeCust[net.treeEdges[waitTe].node] : f.customers;
-  const custIso = custZone - custOut;
+  const custOut = (waitTe !== -1
+    ? net.subtreeCust[net.treeEdges[waitTe].node] : f.customers) - custTie;
+  const custIso = custZone - custOut - custTie;
   const custUnaffected = f.customers - custZone;
   const tTravel = travelMin(te.midDistM);
   return {
     teId, feeder: f.id, faultEdge: te,
     switchEdge: switchTe, recloserEdge: recloserTe,
-    zoneEdges, outEdges,
-    custOut, custIso, custUnaffected,
+    zoneEdges, outEdges, tieEdges,
+    custOut, custIso, custTie, custUnaffected,
     custAffected: custZone,
     conservationOk:
-      Math.abs(custOut + custIso - custZone) < 1e-6 &&
+      Math.abs(custOut + custIso + custTie - custZone) < 1e-6 &&
       Math.abs(custZone + custUnaffected - f.customers) < 1e-6,
-    tSwitch: switchTe !== -1 && custIso > 0 ? SWITCH_MIN : null,
+    tSwitch: (custIso > 0 || custTie > 0) ? SWITCH_MIN : null,
     tTravel,
     tRepairDone: tTravel + REPAIR_MIN,
   };

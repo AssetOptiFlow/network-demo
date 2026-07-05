@@ -25,7 +25,7 @@ export class Renderer {
     this.layers = {
       terrain: true, density: false, roads: true, customers: true,
       network: true, txs: false, switches: true, bridges: true,
-      roadVsLine: false, heat: false, subtx: true,
+      roadVsLine: false, heat: false, subtx: true, ties: true,
     };
     this._heatCache = null;
     this.world = null;
@@ -67,7 +67,7 @@ export class Renderer {
 
   zoomAt(px, py, factor) {
     const wx = this.wx(px), wy = this.wy(py);
-    this.view.scale = Math.min(1.2, Math.max(0.005, this.view.scale * factor));
+    this.view.scale = Math.min(1.2, Math.max(0.0015, this.view.scale * factor));
     this.view.ox = px - wx * this.view.scale;
     this.view.oy = py - wy * this.view.scale;
   }
@@ -156,6 +156,7 @@ export class Renderer {
     if (this.layers.customers) this._drawCustomers();
     if (this.layers.subtx) this._drawSubtx();
     if (this.layers.network) this._drawNetwork();
+    if (this.layers.ties) this._drawTies();
     if (this.layers.roadVsLine) this._drawRoadVsLine();
     this._drawSubsAndTxs();
     if (this.layers.switches) this._drawSwitches();
@@ -203,6 +204,10 @@ export class Renderer {
     if (sc.outEdges.has(teId)) {
       if (p.tMin >= sc.tRepairDone) return STATUS.good;
       return teId === sc.teId ? STATUS.critical : STATUS.serious;
+    }
+    if (sc.tieEdges && sc.tieEdges.has(teId)) {
+      // tripped but BACKFED from the neighbouring feeder via a tie
+      return p.tMin >= (sc.tSwitch ?? Infinity) ? STATUS.good : STATUS.warning;
     }
     if (sc.zoneEdges.has(teId)) {
       // tripped but isolatable behind a sectionaliser
@@ -336,6 +341,33 @@ export class Renderer {
       ctx.lineTo(x - r * 0.72, y);
       ctx.closePath();
       ctx.fill(); ctx.stroke();
+    }
+  }
+
+  // Normally-open tie points between adjacent feeders: a short dashed link
+  // with an OPEN circle at its midpoint (open = carries nothing until a
+  // fault makes the neighbour backfeed through it).
+  _drawTies() {
+    const { ctx, world } = this;
+    const net = world.net, g = world.graph;
+    if (!net.ties) return;
+    for (const t of net.ties) {
+      ctx.strokeStyle = "#52514e";
+      ctx.lineWidth = Math.max(1, this.view.scale * 35);
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(this.sx(g.nx[t.a]), this.sy(g.ny[t.a]));
+      ctx.lineTo(this.sx(g.nx[t.b]), this.sy(g.ny[t.b]));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const mx = this.sx((g.nx[t.a] + g.nx[t.b]) / 2);
+      const my = this.sy((g.ny[t.a] + g.ny[t.b]) / 2);
+      const r = Math.max(2.2, this.view.scale * 70);
+      ctx.fillStyle = "#fcfcfb";
+      ctx.beginPath();
+      ctx.arc(mx, my, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
     }
   }
 

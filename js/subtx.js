@@ -171,7 +171,13 @@ function cellsToPts(terrain, cells, from, to) {
 function maxStraightKm(lines) {
   let worst = 0;
   for (const line of lines) {
-    const p = line.pts;
+    let p = line.pts;
+    // 100 km lines carry hundreds of vertices and this scan is cubic-ish;
+    // subsampling to ~220 points keeps the 150 m chord test meaningful
+    if (p.length > 220) {
+      const step = Math.ceil(p.length / 220);
+      p = p.filter((_, k) => k % step === 0 || k === p.length - 1);
+    }
     for (let i = 0; i < p.length - 1; i++) {
       for (let j = p.length - 1; j > i; j--) {
         const [ax, ay] = p[i], [bx, by] = p[j];

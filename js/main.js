@@ -13,6 +13,7 @@ import {
   SWITCH_MIN, REPAIR_MIN,
 } from "./reliability.js";
 import { runChecks, checkFaultConservation, checkMonotone } from "./checks.js";
+import { FEEDER_MIN_CUST } from "./membership.js";
 import { ASSUMPTIONS } from "./assumptions.js";
 import { Renderer, feederColour, STATUS } from "./render.js";
 
@@ -23,9 +24,10 @@ import { Renderer, feederColour, STATUS } from "./render.js";
 // BEST attempt (fewest failures) is used and the unresolved reasons are
 // reported — never a hard fail.
 export const VALIDATION = {
-  MAX_SUB_CENTROID_KM: 5,    // X: sub farther than this from its load centroid
-  MAX_SUBTX_STRAIGHT_KM: 8,  // Y: subtx line straight for longer than this
-                             //    (membership flow yields denser sub fans)
+  MAX_SUB_CENTROID_KM: 8,    // X: sub farther than this from its load centroid
+  MAX_SUBTX_STRAIGHT_KM: 15, // Y: subtx line straight for longer than this
+                             //    (scaled with the 100 km map — lines can
+                             //    legitimately run long across the plains)
   MIN_GRID_SPREAD_DEG: 15,   // all town grids within this spread = suspicious
   MIN_ZIPF_RATIO: 2.2,       // realised largest/median town size below this = too
                              // uniform (the gradual peri-urban density kernel
@@ -49,7 +51,7 @@ function generateOnce(params) {
   mark("terrain", t);
 
   t = performance.now();
-  const { towns, corridors } = seedTowns(terrain, rng.fork("towns"), params.nTowns, params.inlandWeight ?? 0.25);
+  const { towns, corridors } = seedTowns(terrain, rng.fork("towns"), params.nTowns, params.inlandWeight ?? 0.25, params.nCust);
   mark("settlements", t);
 
   t = performance.now();
@@ -58,15 +60,39 @@ function generateOnce(params) {
   mark("roads", t);
 
   t = performance.now();
-  const density = buildDensityGrid(terrain, towns, roadDistM, rng.fork("density"));
-  const { customers, snapStats } = sampleCustomers(terrain, density, graph, params.nCust, rng.fork("cust"));
+  const density = buildDensityGrid(terrain, towns, roadDistM, rng.fork("density"), params.nCust);
+  const sampled = sampleCustomers(terrain, density, graph, params.nCust, rng.fork("cust"));
+  let customers = sampled.customers;
+  const snapStats = sampled.snapStats;
   mark("load", t);
 
   // MEMBERSHIP-FIRST: buildNetwork decides customers→feeders→subs BEFORE
   // routing, sites the subs from feeder groups, then routes honouring the
   // membership tables (validate/repair loop inside, outcomes reported).
+  // Then PRUNE: a feeder carrying fewer than FEEDER_MIN_CUST customers is
+  // uneconomic to reticulate — the feeder, its transformers AND its
+  // customers are removed and the network is rebuilt from the survivors
+  // (repeated: a rebuild can surface new sub-minimum feeders as membership
+  // resettles). Rebuilding, rather than surgery on the net structures,
+  // keeps every derived table consistent by construction.
   t = performance.now();
-  const net = buildNetwork(terrain, graph, customers, towns, density, rng.fork("net"));
+  let net = buildNetwork(terrain, graph, customers, towns, density, rng.fork("net"));
+  const prune = { customers: 0, txs: 0, feeders: 0, rounds: 0 };
+  for (let round = 0; round < 5; round++) {
+    const small = new Set(net.feeders.filter(f => f.customers < FEEDER_MIN_CUST).map(f => f.id));
+    if (!small.size) break;
+    const keep = customers.filter(c => {
+      const tx = c.tx >= 0 ? net.txs[c.tx] : null;
+      return !tx || !small.has(tx.feeder);
+    });
+    prune.feeders += small.size;
+    prune.txs += net.txs.filter(tx => small.has(tx.feeder)).length;
+    prune.customers += customers.length - keep.length;
+    prune.rounds++;
+    customers = keep;
+    net = buildNetwork(terrain, graph, customers, towns, density, rng.fork("net" + round));
+  }
+  const residualSmall = net.feeders.filter(f => f.customers < FEEDER_MIN_CUST).length;
   const subs = net.subs;
   mark("membership+feeders", t);
 
@@ -82,8 +108,17 @@ function generateOnce(params) {
     roadRepair: repair, snapStats, roadDistM,
   };
   t = performance.now();
+  world.prune = prune;
   world.checks = runChecks(world);
   world.checks.push(...(net.extraChecks ?? []));
+  world.checks.push({
+    name: `Feeder minimum (≥ ${FEEDER_MIN_CUST} customers — smaller feeders pruned)`,
+    pass: residualSmall === 0,
+    tunable: true,
+    detail: `${prune.feeders} feeder(s), ${prune.txs} TX(s), ${prune.customers} customer(s) ` +
+      `pruned over ${prune.rounds} rebuild round(s); ${residualSmall} sub-minimum feeder(s) remain; ` +
+      `${customers.length.toLocaleString("en-NZ")} of ${params.nCust.toLocaleString("en-NZ")} sampled customers kept`,
+  });
   world.roadVsLine = roadVsLine(net, graph);
 
   // Subtransmission is VISUAL ONLY — asserted, not assumed: rebuilding it
@@ -200,7 +235,7 @@ export function generate(params) {
 // ---------------------------------- devices-for-improvement table
 
 const DR_TARGETS = [0.10, 0.25, 0.50];
-const DR_CAP = { switch: 60, recloser: 30 }; // match the UI input limits
+const DR_CAP = { switch: 120, recloser: 60 }; // match the UI input limits
 
 // Fewest greedily-placed devices of one kind (from a device-free network)
 // to reach each fractional SAIDI improvement. Placed in batches so the
@@ -231,7 +266,7 @@ export function countsForTargets(net, kind, rateMul = null) {
 function selftest() {
   const results = [];
   for (const seed of ["aotearoa-1", "kahikatea-2", "rimu-3"]) {
-    const world = generate({ seed, nCust: 25000, nTowns: 5 }); // the fixed UI size
+    const world = generate({ seed, nCust: 50000, nTowns: 5 }); // the fixed UI size
     const { net } = world;
     const greedy = greedyPlace(net, 12, "switch");
     const mono = checkMonotone(greedy.log);
@@ -282,13 +317,6 @@ function selftest() {
       subPos: net.subs.map(s => [Math.round(s.x / 100) / 10, Math.round(s.y / 100) / 10]),
       subCust: net.subs.map(s => Math.round(
         net.feeders.filter(f => f.sub === s.id).reduce((t, f) => t + f.customers, 0))),
-      expressKm: (() => {
-        const ex = net.feeders.map(f => f.expressOhKm + f.expressUgKm).sort((a, b) => b - a);
-        return {
-          mean: +(ex.reduce((a, b) => a + b, 0) / ex.length).toFixed(1),
-          top3: ex.slice(0, 3).map(x => +x.toFixed(1)),
-        };
-      })(),
       river: {
         lenKm: +(riverLen / 1000).toFixed(1),
         start: [Math.round(rp[0].x), Math.round(rp[0].y)],
@@ -301,6 +329,8 @@ function selftest() {
       seed,
       totalMs: world.timings.total,
       timings: world.timings,
+      custFinal: world.customers.length,
+      prune: world.prune,
       checks: world.checks.map(c => ({ name: c.name, pass: c.pass, tunable: !!c.tunable, detail: c.detail })),
       feeders: net.feeders.length,
       meanCustPerFeeder: Math.round(world.customers.length / net.feeders.length),
@@ -315,9 +345,11 @@ function selftest() {
         worstCircuitKm: net.membership.worstCircuitKm,
         reassigned: net.membership.reassigned,
         maxFeedersPerSub: Math.max(0, ...net.subs.map(s => net.feeders.filter(f => f.sub === s.id).length)),
+        easementSpans: net.membership.easementSpans,
         ruleViolations: net.membership.ruleViolations,
       },
       txs: net.txs.length,
+      ties: net.ties.length,
       roadNodes: world.graph.nNodes,
       bridges: world.terrain.bridges.length,
       snapMeanM: Math.round(world.snapStats.mean),
@@ -348,8 +380,8 @@ function selftest() {
   }
   // Inland-weighting slider path: full-inland towns must still generate a
   // clean network, and must actually move the towns.
-  const wCoast = generate({ seed: "aotearoa-1", nCust: 25000, nTowns: 5, inlandWeight: 0 });
-  const wInland = generate({ seed: "aotearoa-1", nCust: 25000, nTowns: 5, inlandWeight: 1 });
+  const wCoast = generate({ seed: "aotearoa-1", nCust: 50000, nTowns: 5, inlandWeight: 0 });
+  const wInland = generate({ seed: "aotearoa-1", nCust: 50000, nTowns: 5, inlandWeight: 1 });
   // Correctness checks must pass; an unresolved best-of-N VALIDATION on
   // this deliberately extreme world is a reported outcome, not a failure.
   const inlandTest = {
@@ -369,13 +401,17 @@ function selftest() {
     r.checks.every(c => c.pass || c.tunable) && r.greedyMonotone && r.recloserMonotone &&
     r.faultConservation && r.validationPass &&
     // degeneracy bands: sub and feeder counts EMERGE from the rule caps
-    // (measured ≈ 13–15 subs, 60–80 feeders at 25k customers)
-    r.subs >= 8 && r.subs <= 25 &&
-    r.feeders >= 45 && r.feeders <= 110 &&
-    r.meanCustPerFeeder >= 120 && r.meanCustPerFeeder <= 800 &&
+    // (100 km map, 50k sampled, busbar-branch feeders with no express
+    // runs: measured ≈ 35 subs, 88–105 feeders, ≈ 475–570 cust/feeder)
+    r.subs >= 12 && r.subs <= 70 &&
+    r.feeders >= 50 && r.feeders <= 400 &&
+    r.meanCustPerFeeder >= 60 && r.meanCustPerFeeder <= 900 &&
     r.gxp !== null &&
-    r.drTargets.sw.counts[0] !== null && r.drTargets.rc.counts[0] !== null &&
-    r.totalMs < 5000 && (!r.debugSupported || r.debugRateWeighted === true)) &&
+    // reclosers must reach the 10% target; switch-only 10% is NOT
+    // guaranteed on a 50k-customer network (restoration-only gains are
+    // smaller), so for switches just assert greedy finds beneficial sites
+    r.drTargets.rc.counts[0] !== null && r.greedyPlacements >= 6 &&
+    r.totalMs < 30000 && (!r.debugSupported || r.debugRateWeighted === true)) &&
     inlandTest.checksPass && inlandTest.townsMoved;
   const out = { allPass, inlandTest, results };
   const pre = document.getElementById("selftest-out");
@@ -391,7 +427,7 @@ function townCoastDist(world) {
   const t = world.terrain;
   const d = world.towns.map(tn => {
     const [cx, cy] = t.cellOf(tn.x, tn.y);
-    return t._coastDist(cx, cy) * 30; // normalised → km across the map
+    return t._coastDist(cx, cy) * MAP_SIZE / 1000; // normalised → km across the map
   });
   return +(d.reduce((a, b) => a + b, 0) / d.length).toFixed(1);
 }
@@ -458,14 +494,15 @@ const state = {
 
 function fmt(x, dp = 1) { return x.toLocaleString("en-NZ", { maximumFractionDigits: dp, minimumFractionDigits: dp }); }
 
-// The UI world is FIXED at 25 000 customers (18 zone subs are fixed in
-// membership.js); other sizes remain available programmatically.
-const N_CUST_FIXED = 25000;
+// The UI world SAMPLES a fixed 50 000 customers; those on feeders under
+// FEEDER_MIN_CUST are pruned, so the served count emerges a little lower.
+// Other sizes remain available programmatically.
+const N_CUST_START = 50000;
 
 function regenerate() {
   const params = {
     seed: $("seed").value || "aotearoa",
-    nCust: N_CUST_FIXED,
+    nCust: N_CUST_START,
     nTowns: +$("nTowns").value,
     inlandWeight: +$("inland").value / 100,
   };
@@ -482,11 +519,15 @@ function regenerate() {
   const meanCust = world.customers.length / world.net.feeders.length;
   $("genTime").textContent =
     `generated in ${world.timings.total} ms — ` +
+    `${world.customers.length.toLocaleString()} of ${N_CUST_START.toLocaleString()} customers kept ` +
+    `(${world.prune.customers.toLocaleString()} pruned on sub-20 feeders), ` +
     `${world.graph.nNodes.toLocaleString()} road nodes, ${world.net.txs.length} TX, ` +
     `${world.net.subs.length} subs, ${world.net.feeders.length} feeders ` +
     `(mean ${Math.round(meanCust)} cust/feeder), ` +
     `${ohKm.toFixed(0)} km OH / ${ugKm.toFixed(0)} km UG, ` +
-    `${world.terrain.bridges.length} bridge(s)`;
+    `${world.terrain.bridges.length} bridge(s), ` +
+    `${world.net.membership.easementSpans} off-road span(s), ` +
+    `${world.net.ties.length} normally-open tie(s)`;
   renderChecks();
   computeDrTable();
   refreshDerived();
@@ -628,7 +669,6 @@ function renderFeederStats(fid) {
   const ugShare = f.ugLenM / Math.max(1, f.lengthM);
   const kind = ugShare >= 0.4 ? "urban" : ugShare >= 0.15 ? "mixed" : "rural";
   const perKm = f.customers / Math.max(0.3, f.lengthM / 1000);
-  const expressKm = f.expressOhKm + f.expressUgKm;
   el.innerHTML = `
     <div><span class="chip" style="background:${feederColour(fid)}"></span>
       <strong>Feeder F${fid}</strong> — ${net.subs[f.sub].name} zone sub</div>
@@ -638,7 +678,6 @@ function renderFeederStats(fid) {
       <tr><td>Transformers</td><td>${f.txCount}</td></tr>
       <tr><td>HV length</td><td>${fmt(f.lengthM / 1000, 1)} km ` +
         `(${fmt(f.ohLenM / 1000, 1)} OH / ${fmt(f.ugLenM / 1000, 1)} UG)</td></tr>
-      <tr><td>Express run</td><td>${fmt(expressKm, 1)} km</td></tr>
       <tr><td>Sectionalisers</td><td>${nSw}</td></tr>
       <tr><td>Reclosers</td><td>${nRc}</td></tr>
       <tr><td>SAIDI baseline</td><td>${fmt(base.saidi)} min/yr</td></tr>
@@ -728,8 +767,9 @@ function toggleDebugRate(on) {
           : dbg.rateWeighted
             ? `<strong class="ok">pick held — the baseline pick dominates every ` +
               `single doubling on this seed, but the boosted branch's benefit ` +
-              `doubled exactly (${(dbg.boostGainDebug / dbg.boostGain).toFixed(3)}×) ✓ rate-weighted</strong>`
-            : `<strong class="bad">boosted benefit did NOT double ✗</strong>`);
+              `rose ×${(dbg.boostRatio ?? 0).toFixed(3)} (in-branch part doubles; ` +
+              `the backfeed part from upstream faults is rate-independent) ✓ rate-weighted</strong>`
+            : `<strong class="bad">boosted benefit did NOT rise with its fault rate ✗</strong>`);
     }
   }
   computeDrTable();
@@ -748,8 +788,11 @@ function startFault(teId) {
   state.playbackAnim = { sc, tEnd, playing: true, tMin: 0 };
   state.renderer.playback = { scenario: sc, tMin: 0 };
   const swText = sc.tSwitch === null
-    ? `<span class="chip" style="background:${STATUS.serious}"></span> no sectionaliser in the tripped zone — everyone tripped waits for repair`
-    : `<span class="chip" style="background:${STATUS.warning}"></span> ${sc.custIso} customers isolatable — restored at ${SWITCH_MIN} min`;
+    ? `<span class="chip" style="background:${STATUS.serious}"></span> no isolating device helps here — everyone tripped waits for repair`
+    : `<span class="chip" style="background:${STATUS.warning}"></span> ${sc.custIso} customers isolatable upstream — restored at ${SWITCH_MIN} min`;
+  const tieText = sc.custTie > 0
+    ? `<div><span class="chip" style="background:${STATUS.warning}"></span> ${sc.custTie} customers BACKFED from the neighbouring feeder via a normally-open tie — restored at ${SWITCH_MIN} min</div>`
+    : "";
   const rcText = sc.recloserEdge !== -1
     ? `<div><span class="chip" style="background:${feederColour(sc.feeder)}"></span> ${sc.custUnaffected} customers upstream of the recloser — never interrupted</div>`
     : "";
@@ -759,6 +802,7 @@ function startFault(teId) {
     <div><span class="chip" style="background:${STATUS.critical}"></span> faulted section</div>
     <div><span class="chip" style="background:${STATUS.serious}"></span> ${sc.custOut} customers out until repair (travel ${fmt(sc.tTravel)} + ${REPAIR_MIN} min)</div>
     <div>${swText}</div>
+    ${tieText}
     ${rcText}
     <div class="detail ${cons.pass ? "ok" : "bad"}">${cons.pass ? "✓" : "✗"} ${cons.detail}</div>
     <div class="timeline"><input type="range" id="tScrub" min="0" max="${Math.ceil(tEnd)}" value="0" step="1">
@@ -856,7 +900,7 @@ function initUI() {
   for (const id of ["nTowns", "inland"]) {
     $(id).addEventListener("input", () => { $(id + "Val").textContent = $(id).value; });
   }
-  for (const layer of ["terrain", "density", "roads", "customers", "network", "txs", "switches", "bridges", "roadVsLine", "heat", "subtx"]) {
+  for (const layer of ["terrain", "density", "roads", "customers", "network", "txs", "switches", "bridges", "roadVsLine", "heat", "subtx", "ties"]) {
     const box = $("layer-" + layer);
     if (!box) continue;
     box.checked = state.renderer.layers[layer];

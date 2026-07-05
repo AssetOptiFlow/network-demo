@@ -1,7 +1,7 @@
-// terrain.js — synthetic geography for a ~30 x 30 km map.
+// terrain.js — synthetic geography for a ~100 x 100 km map.
 //
 // ASSUMPTIONS (also surfaced in the UI assumptions panel):
-//  - Map is 30 x 30 km sampled on a 200 m grid (150 x 150 cells).
+//  - Map is 100 x 100 km sampled on a 200 m grid (500 x 500 cells).
 //  - Sea lies along one map edge (chosen from the seed); elevation is
 //    fBm noise plus a ramp away from that edge, so the coastline wiggles.
 //  - Exactly one river is traced from a high inland cell to the sea by
@@ -12,9 +12,9 @@
 
 import { fbm } from "./noise.js";
 
-export const MAP_SIZE = 30000;   // metres
+export const MAP_SIZE = 100000;  // metres
 export const CELL = 200;         // metres per grid cell
-export const GRID_N = MAP_SIZE / CELL; // 150
+export const GRID_N = MAP_SIZE / CELL; // 500
 
 const ELEV_SCALE_M = 700;        // multiplier from unit elevation to metres
 const SLOPE_BUILD_MAX = 0.35;    // m/m — steeper than this is unbuildable
@@ -65,7 +65,7 @@ export class Terrain {
 
   _buildElevation(seed) {
     const n = this.n;
-    const freq = 3.4; // noise cycles across map
+    const freq = 3.4 * MAP_SIZE / 30000; // keep ~9 km terrain wavelength at any map size
     for (let cy = 0; cy < n; cy++) {
       for (let cx = 0; cx < n; cx++) {
         const u = cx / n, v = cy / n;
@@ -164,7 +164,7 @@ export class Terrain {
     let mvx = cw[0], mvy = cw[1]; // momentum
     const step = 100; // metres
     const pts = pts0;
-    for (let s = 0; s < 3000; s++) {
+    for (let s = 0; s < 12000; s++) { // enough steps for a wiggly 100 km run
       pts.push({ x: px, y: py });
       const [cx, cy] = this.cellOf(px, py);
       if (this.ocean[this.idx(cx, cy)]) break; // reached the actual sea
@@ -192,7 +192,7 @@ export class Terrain {
     const m = pts.length;
     for (let i = 0; i < m; i++) {
       const t = i / Math.max(1, m - 1);
-      pts[i].w = 60 + 80 * t;
+      pts[i].w = 60 + 150 * t; // wider mouth on the longer run
     }
     this.riverPath = pts;
     // Rasterise into water=2.

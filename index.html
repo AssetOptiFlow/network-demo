@@ -20,6 +20,7 @@
       <span><i class="chip chip-line"></i> feeder (colour = identity, dashed = underground)</span>
       <span><i class="chip" style="background:#fcfcfb;border:2px solid #2a78d6"></i> sectionaliser</span>
       <span><i class="chip" style="background:#2a78d6;border:1.5px solid #0b0b0b;transform:rotate(45deg)"></i> recloser</span>
+      <span><i class="chip" style="background:#fcfcfb;border:1.5px solid #52514e;border-radius:50%"></i> tie (normally open)</span>
       <span><i class="chip" style="background:#fff;border:1.5px solid #0b0b0b"></i> bridge</span>
       <span><i class="chip" style="background:#0b0b0b"></i> zone sub</span>
       <span><i class="chip" style="background:repeating-linear-gradient(90deg,#3a3935 0 5px,transparent 5px 8px)"></i> subtransmission (visual only)</span>
@@ -36,11 +37,17 @@
       </div>
       <div class="row">
         <label>Customers</label>
-        <span class="detail">25,000 (fixed) · subs &amp; feeders emerge from rule caps</span>
+        <span class="detail">50,000 sampled · feeders under 20 customers pruned
+          (with their customers &amp; TXs) · subs &amp; feeders emerge from rule caps</span>
       </div>
       <div class="row">
-        <label for="nTowns">Towns <span id="nTownsVal">5</span></label>
-        <input id="nTowns" type="range" min="3" max="6" step="1" value="5">
+        <label for="nTowns">Small towns <span id="nTownsVal">4</span></label>
+        <input id="nTowns" type="range" min="2" max="6" step="1" value="4">
+      </div>
+      <div class="row">
+        <span class="detail">1 large town (~40% of customers) + the small towns
+          (1,000–2,000 each) + 6–10 rural settlements (200–500 each);
+          the rest is roadside rural load</span>
       </div>
       <div class="row">
         <label for="inland" title="0% = coastal towns; 100% = flat river-valley towns">Inland <span id="inlandVal">25</span>%</label>
@@ -64,6 +71,7 @@
         <label><input type="checkbox" id="layer-roadVsLine"> road vs line</label>
         <label><input type="checkbox" id="layer-heat"> SAIDI heat</label>
         <label><input type="checkbox" id="layer-subtx"> subtransmission</label>
+        <label><input type="checkbox" id="layer-ties"> ties (N/O)</label>
       </div>
       <div class="detail">Drag to pan, wheel to zoom. Click a feeder line for stats.
         With “road vs line” on and a section selected: solid black = crew road route,
@@ -102,18 +110,20 @@
       <h2>Greedy devices</h2>
       <div class="row">
         <label for="nSwitches">Sectionalisers</label>
-        <input id="nSwitches" type="number" min="1" max="60" value="1" style="width:4em">
+        <input id="nSwitches" type="number" min="1" max="120" value="1" style="width:4em">
         <button id="placeSwitches" class="primary">Place</button>
       </div>
       <div class="row">
         <label for="nReclosers">Reclosers</label>
-        <input id="nReclosers" type="number" min="1" max="30" value="1" style="width:4em">
+        <input id="nReclosers" type="number" min="1" max="60" value="1" style="width:4em">
         <button id="placeReclosers" class="primary">Place</button>
         <button id="resetSwitches">Reset all</button>
       </div>
-      <div class="detail">Sectionalisers restore upstream customers at 45 min.
-        Reclosers clear downstream faults — upstream customers see no sustained
-        interruption at all (momentaries not modelled).</div>
+      <div class="detail">Sectionalisers restore upstream customers at 45 min —
+        and, where a normally-open tie to a neighbouring feeder sits beyond the
+        device, DOWNSTREAM customers backfeed at 45 min too. Reclosers clear
+        downstream faults — upstream customers see no sustained interruption
+        (momentaries not modelled) — and double as isolators for backfeed.</div>
       <label class="detail"><input type="checkbox" id="debugRate">
         Debug: double λ on one branch (first pick should move — proof the score is rate-weighted)</label>
       <div id="debugInfo" class="detail"></div>

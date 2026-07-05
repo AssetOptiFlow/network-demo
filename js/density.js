@@ -10,12 +10,16 @@
 //    of a PROVISIONAL corridor skeleton (least-cost routes between the two
 //    anchor towns and map-edge exits — the same routes later seed the
 //    arterials, so no layer is placed independently).
-//  - Town populations follow a Zipf rank-size law: pop_r ∝ 1/(r+1)^1.05 —
-//    one dominant town, 2–3 medium, the rest small. Town radius σ ∝ √pop
-//    (uniform peak density), so realised customer counts track population.
-//  - Minimum spacing scales with town size: 2.2 km + 1.6×(σ_i + σ_j).
+//  - Settlements form an EXPLICIT three-tier hierarchy (customer targets
+//    as shares of the sampled total, so at 50k customers): ONE large town
+//    ≈ 40% (~20,000), each small town 2–4% (1,000–2,000), each rural
+//    settlement 0.4–1% (200–500). Kernel weights are set so realised
+//    counts hit these targets; the rural background gets the remainder.
+//  - Town radius σ ∝ √customers (uniform peak density — area tracks
+//    population, density doesn't).
+//  - Minimum spacing scales with town size: 5 km + 1.6×(σ_i + σ_j).
 //  - Towns are seeded on BOTH banks of the river when land allows.
-//  - Density = per-town Gaussians + rural background that decays with
+//  - Density = per-town kernels + rural background that decays with
 //    road distance (sparse rural load ALONG ROADS), all × fBm noise from
 //    the same noise family as the terrain, zeroed off buildable land.
 
@@ -23,29 +27,42 @@ import { fbm01 } from "./noise.js";
 import { CELL, GRID_N, MAP_SIZE, bfsDistanceM } from "./terrain.js";
 import { GridRouter } from "./roads.js";
 
-// α = 1.25 keeps REALISED size ratios comfortably Zipf (prescribed
-// largest/median ≈ 4, largest/second ≈ 2.4) even after clipping noise —
-// the validation threshold is largest/median ≥ 3.
-const ZIPF_ALPHA = 1.25;
-const SIGMA_MAX = 2300;   // dominant town radius (m)
-const SIGMA_MIN = 850;
-const SEP_BASE = 2200;    // min spacing = SEP_BASE + SEP_SIGMA*(σi+σj)
+// Three-tier hierarchy: customer targets as SHARES of the sampled total.
+export const BIG_SHARE = 0.40;          // the one dominant town (~20k at 50k)
+export const SMALL_SHARE = [0.02, 0.04];   // per small town (1,000–2,000 at 50k)
+export const SETT_SHARE = [0.004, 0.01];   // per rural settlement (200–500 at 50k)
+const N_SETTLEMENTS_MIN = 6, N_SETTLEMENTS_MAX = 10;
+
+// σ ∝ √customers, calibrated so a 20,000-customer town has σ ≈ 2 km
+// (peak density ≈ 500 customers/km² in every tier).
+const SIGMA_REF = 2000, SIGMA_REF_CUST = 20000;
+const SIGMA_MIN = 220;
+const sigmaOfCust = (cust) =>
+  Math.max(SIGMA_MIN, SIGMA_REF * Math.sqrt(cust / SIGMA_REF_CUST));
+
+const SEP_BASE = 5000;    // min spacing = SEP_BASE + SEP_SIGMA*(σi+σj)
 const SEP_SIGMA = 1.6;
 
 const TOWN_NAMES = [
   "Waimotu", "Kereru Flat", "Tōtara Bay", "Pahiwi", "Ōkere",
-  "Matai Junction", "Huringa", "Te Awa Iti",
+  "Matai Junction", "Huringa", "Te Awa Iti", "Puketea", "Rata Gully",
+  "Mānuka Flat", "Kōwhai Bend", "Te Rimu", "Awanui Ford", "Pīpiri",
+  "Whero Downs", "Ngaio Corner", "Karaka Crossing", "Mahoe Landing",
+  "Tūī Bush",
 ];
 
-export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25) {
+// nTowns = the number of SMALL towns (tier 1); the one large town and the
+// seeded 6–10 rural settlements are added around them.
+export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25, nCust = 50000) {
   const w = Math.max(0, Math.min(1, inlandWeight));
   const r = rng.fork("townsites");
   const rp = terrain.riverPath;
   const mouth = rp.length ? rp[rp.length - 1] : null;
 
-  // Candidate pool (terrain-only scores; corridor terms added later).
+  // Candidate pool (terrain-only scores; corridor terms added later) —
+  // sized for the 100 km map so good sites are still densely sampled.
   const cand = [];
-  for (let k = 0; k < 1200; k++) {
+  for (let k = 0; k < 4000; k++) {
     const x = r.range(1500, MAP_SIZE - 1500);
     const y = r.range(1500, MAP_SIZE - 1500);
     if (!terrain.buildableAt(x, y)) continue;
@@ -62,43 +79,54 @@ export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25) {
   }
   cand.sort((a, b) => b.score - a.score);
 
-  // Zipf populations (pop_0 = 1 for the dominant town).
-  const pops = [];
-  for (let i = 0; i < nTowns; i++) pops.push(1 / Math.pow(i + 1, ZIPF_ALPHA));
-  const sigmaOf = (pop) => Math.max(SIGMA_MIN, SIGMA_MAX * Math.sqrt(pop));
+  // Explicit tier targets: one large town, nTowns small towns, then a
+  // seeded handful of rural settlements. Customer counts, not ranks.
+  const rSize = rng.fork("townsize");
+  const targets = [{ tier: 0, cust: BIG_SHARE * nCust * rSize.range(0.95, 1.05) }];
+  for (let i = 0; i < nTowns; i++) {
+    targets.push({ tier: 1, cust: rSize.range(SMALL_SHARE[0], SMALL_SHARE[1]) * nCust });
+  }
+  const nSett = N_SETTLEMENTS_MIN +
+    rng.fork("nsett").int(0, N_SETTLEMENTS_MAX - N_SETTLEMENTS_MIN);
+  for (let i = 0; i < nSett; i++) {
+    targets.push({ tier: 2, cust: rSize.range(SETT_SHARE[0], SETT_SHARE[1]) * nCust });
+  }
 
   const towns = [];
-  const rSize = rng.fork("townsize");
   const farEnough = (c, sigma) => towns.every(t =>
     Math.hypot(t.x - c.x, t.y - c.y) >= SEP_BASE + SEP_SIGMA * (t.sigma + sigma));
   const pickFrom = (pool, sigma) => pool.find(c => farEnough(c, sigma)) ?? null;
-  const push = (c) => {
+  const push = (c, tgt) => {
     const rank = towns.length;
-    const pop = pops[rank] * rSize.range(0.9, 1.1);
     towns.push({
       x: c.x, y: c.y, side: c.side,
-      pop, sigma: sigmaOf(pop),
-      weight: 1.0 * rSize.range(0.9, 1.1), // uniform peak density; area ∝ pop
+      tier: tgt.tier, cust: tgt.cust,
+      pop: tgt.cust / (BIG_SHARE * nCust), // relative size for street spacing
+      sigma: sigmaOfCust(tgt.cust),
+      weight: 1.0, // absolute kernel weight, set by buildDensityGrid
       name: TOWN_NAMES[rank % TOWN_NAMES.length],
       theta: 0, // grid axis, set by the road layer
     });
   };
 
-  // ---- Phase A: two anchor towns from terrain-only scores (other bank
-  // forced for the second when land allows — river towns straddle).
-  const a1 = pickFrom(cand, sigmaOf(pops[0]));
-  if (a1) push(a1);
-  if (nTowns > 1 && towns.length) {
+  // ---- Phase A: two anchors from terrain-only scores — the large town
+  // and the first small town (other bank forced when land allows, so
+  // river towns straddle).
+  const a1 = pickFrom(cand, sigmaOfCust(targets[0].cust));
+  if (a1) push(a1, targets[0]);
+  if (targets.length > 1 && towns.length) {
     const other = cand.filter(c => c.side !== towns[0].side);
-    const a2 = pickFrom(other, sigmaOf(pops[1])) ?? pickFrom(cand, sigmaOf(pops[1]));
-    if (a2) push(a2);
+    const s1 = sigmaOfCust(targets[1].cust);
+    const a2 = pickFrom(other, s1) ?? pickFrom(cand, s1);
+    if (a2) push(a2, targets[1]);
   }
 
   // ---- Phase B: provisional corridor skeleton between anchors and
   // map-edge exits; junctions of these corridors attract later towns.
   const corridors = buildCorridorSkeleton(terrain, towns);
 
-  // ---- Phase C: remaining towns, rescored with corridor terms.
+  // ---- Phase C: remaining small towns then settlements, rescored with
+  // corridor terms (service towns grow where routes meet).
   const corDist = corridors.corridorDistM, juncDist = corridors.junctionDistM;
   const n = GRID_N;
   for (const c of cand) {
@@ -109,16 +137,18 @@ export function seedTowns(terrain, rng, nTowns, inlandWeight = 0.25) {
       1.1 * Math.exp(-(juncDist[i] ?? 1e9) / 2500);
   }
   cand.sort((a, b) => b.score - a.score);
-  while (towns.length < nTowns) {
-    const sigma = sigmaOf(pops[towns.length]);
+  while (towns.length < targets.length) {
+    const tgt = targets[towns.length];
+    const sigma = sigmaOfCust(tgt.cust);
     const sides = new Set(towns.map(t => t.side));
     let c = null;
-    if (towns.length >= 1 && sides.size === 1) {
+    // keep both banks settled while placing the small towns
+    if (tgt.tier === 1 && towns.length >= 1 && sides.size === 1) {
       c = pickFrom(cand.filter(k => k.side !== towns[0].side), sigma);
     }
     if (!c) c = pickFrom(cand, sigma);
     if (!c) break;
-    push(c);
+    push(c, tgt);
   }
   return { towns, corridors };
 }
@@ -187,16 +217,21 @@ function townKernel(r2, sigma) {
 const KERNEL_R_SIGMA = 6; // integration / evaluation radius (σ) for the tail
 
 // Density field — built AFTER roads so rural load can hug them.
-export function buildDensityGrid(terrain, towns, roadDistM, rng) {
+// Field masses are set in CUSTOMER units: each town kernel integrates to
+// its tier target, and the rural background is scaled to the remainder
+// (nCust − Σ town targets), so realised counts track the hierarchy. The
+// finished grid is then normalised so the densest town core sits near 1.0
+// (the underground-cable threshold in network.js reads those units).
+export function buildDensityGrid(terrain, towns, roadDistM, rng, nCust = 50000) {
   const n = GRID_N;
   const seed = Math.floor(rng.fork("density-noise").float() * 1e9);
   const grid = new Float32Array(n * n);
   let maxD = 0;
 
   // Mass compensation: a town kernel clipped by sea/steep land loses
-  // customers, flattening the Zipf distribution. Integrate each kernel
-  // over BUILDABLE cells and set its weight so realised mass ∝ population
-  // (a hemmed-in town gets denser, not smaller — very Wellington).
+  // customers. Integrate each kernel over BUILDABLE cells and set its
+  // weight so realised mass = the tier's customer target (a hemmed-in
+  // town gets denser, not smaller — very Wellington).
   const rawW = towns.map(t => {
     let I = 0;
     const R = Math.ceil(KERNEL_R_SIGMA * t.sigma / CELL);
@@ -209,24 +244,45 @@ export function buildDensityGrid(terrain, towns, roadDistM, rng) {
         I += townKernel((x - t.x) ** 2 + (y - t.y) ** 2, t.sigma);
       }
     }
-    return t.pop / Math.max(1e-6, I);
+    return t.cust / Math.max(1e-6, I);
   });
-  const sortedW = rawW.slice().sort((a, b) => a - b);
-  const ref = sortedW[Math.floor(sortedW.length / 2)] || 1;
-  towns.forEach((t, i) => { t.weight = Math.min(2.5, rawW[i] / ref); });
+  towns.forEach((t, i) => { t.weight = rawW[i]; });
+  const peakW = Math.max(1e-6, ...rawW);
+
+  // Rural background pass 1: raw roadside + off-road-shoulder values, so
+  // the whole rural field can be scaled to its customer remainder.
+  const ruralRaw = new Float32Array(n * n);
+  let ruralSum = 0;
+  for (let i = 0; i < n * n; i++) {
+    if (!terrain.buildableCell(i)) continue;
+    // Sparse rural load along roads (decays with road distance) plus an
+    // off-road SHOULDER: farms a few km past the end of the road, reached
+    // by cross-country line easements. Hard zero beyond 6 km so nobody
+    // settles the trackless back country (which would drag zone-sub
+    // centroids — and easement chains — deep into roadless land).
+    const rd = roadDistM ? roadDistM[i] : 0;
+    const rdm = isFinite(rd) ? rd : 1e9;
+    const v = 0.020 * Math.exp(-rdm / 1000) +
+      (rdm < 6000 ? 0.0030 * Math.exp(-rdm / 1800) : 0);
+    ruralRaw[i] = v;
+    ruralSum += v;
+  }
+  const townTotal = towns.reduce((s, t) => s + t.cust, 0);
+  const ruralScale = Math.max(0, nCust - townTotal) / Math.max(1e-9, ruralSum);
+
+  const nf = 4.2 * MAP_SIZE / 30000; // keep the noise wavelength in km terms
   for (let cy = 0; cy < n; cy++) {
     for (let cx = 0; cx < n; cx++) {
       const i = cy * n + cx;
       if (!terrain.buildableCell(i)) continue;
       const [x, y] = terrain.cellCentre(cx, cy);
-      // Sparse rural load along roads: decays with road distance.
-      const rd = roadDistM ? roadDistM[i] : 0;
-      let d = 0.022 * Math.exp(-(isFinite(rd) ? rd : 1e9) / 800);
+      let d = ruralScale * ruralRaw[i];
       for (const t of towns) {
         const r2 = (x - t.x) ** 2 + (y - t.y) ** 2;
         if (r2 < (KERNEL_R_SIGMA * t.sigma) ** 2) d += t.weight * townKernel(r2, t.sigma);
       }
-      d *= 0.55 + 0.9 * fbm01(cx / n * 4.2, cy / n * 4.2, seed, 4);
+      d /= peakW; // normalise: densest town core ≈ 1.0 (UG threshold units)
+      d *= 0.55 + 0.9 * fbm01(cx / n * nf, cy / n * nf, seed, 4);
       grid[i] = d;
       if (d > maxD) maxD = d;
     }

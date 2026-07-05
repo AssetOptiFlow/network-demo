@@ -4,10 +4,13 @@
 //   customers → TX:   ≤ TX_MAX_M from the transformer OR ≤ TX_MAX_CUST
 //                     (rural maxes out on distance, urban on count)
 //   TX → zone sub:    ≤ SUB_MAX_KM by road OR ≤ SUB_MAX_CUST per sub
-//   feeders:          ≤ FEEDER_MAX_CUST and ≤ FEEDER_MAX_KM circuit length,
-//                     relaxed to FEEDER_LONG_KM while under FEEDER_LONG_CUST
-//                     (a remote valley rides one long skinny feeder instead
-//                     of becoming a micro-sub)
+//   feeders:          ≤ FEEDER_MAX_CUST and ≤ FEEDER_MAX_KM circuit length
+//                     (owned + trunk run) — one FLAT length cap, no
+//                     long-rural tier; a feeder that carries fewer than
+//                     FEEDER_MIN_CUST customers is PRUNED — the feeder,
+//                     its transformers AND its customers are removed and
+//                     the network is rebuilt from the survivors
+//                     (uneconomic to reticulate)
 //
 // The membership atom is the LOAD NODE — a road node with ≥ 1 TX snapped to
 // it. Routing (network.js) assigns every load node to its road-NEAREST
@@ -18,12 +21,14 @@
 
 export const TX_MAX_CUST = 100;      // customers per distribution transformer
 export const TX_MAX_M = 500;         // customer → transformer distance (m)
-export const SUB_MAX_CUST = 2000;    // customers per zone sub
-export const SUB_MAX_KM = 25;        // transformer → zone sub, by road
-export const FEEDER_MAX_CUST = 500;  // customers per feeder (uniform)
-export const FEEDER_MAX_KM = 25;     // feeder circuit length (owned + trunk run)
-export const FEEDER_LONG_KM = 40;    // long-feeder allowance…
-export const FEEDER_LONG_CUST = 50;  // …while carrying fewer than this
+export const SUB_MAX_CUST = 4000;    // customers per zone sub
+export const SUB_MAX_KM = 50;        // transformer → zone sub, by road
+export const FEEDER_MAX_CUST = 1000; // customers per feeder (uniform)
+export const FEEDER_MAX_KM = 50;     // feeder REACH — line distance from the
+                                     // sub to the farthest point (flat; total
+                                     // conductor is unbounded, feeders branch)
+export const FEEDER_MIN_CUST = 20;   // feeders under this are pruned entirely
+                                     // (with their customers and transformers)
 
 // Urban/rural is REPORTING-ONLY now (the caps are uniform): a customer is
 // urban when local density ≥ URBAN_CUST_PER_KM2 within DENSITY_RADIUS_M.
