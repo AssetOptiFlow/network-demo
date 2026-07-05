@@ -57,8 +57,12 @@ import {
   classifyCustomers, buildLoadNodes, growSubs, NodeHeap, morton,
   TX_MAX_CUST, TX_MAX_M, SUB_MAX_CUST, SUB_MIN_CUST, SUB_MAX_COUNT,
   SUB_MAX_KM, FEEDER_MAX_CUST, FEEDER_MAX_KM, FEEDERS_MAX_PER_SUB,
-  FEEDER_MIN_CUST, LEAD_MAX_M, MERGE_HEADROOM,
+  FEEDER_MIN_CUST, LEAD_MAX_M, MERGE_HEADROOM, FEEDER_TARGET_SAIDI,
+  REHOME_MIN_GAIN_M, BALANCE_ABSORBER_MAX, BALANCE_MIN_DIFF,
 } from "./membership.js";
+import {
+  DEFAULT_FAULT_RATES, LATERAL_FUSE_MAX_CUST, REPAIR_MIN, TRAVEL_KMH,
+} from "./reliability.js";
 import { CLS_EASEMENT } from "./roads.js";
 import { MAP_MAX } from "./terrain.js";
 
@@ -68,6 +72,10 @@ export const OFFROAD_SNAP_M = 400;
 // Town peaks sit near 1.0 (mass-compensated), so this keeps cable to the
 // inner core (roughly r < σ) rather than whole towns.
 export const UG_DENSITY_THRESH = 0.4; // density units — inner-urban ⇒ cable
+
+// Max unused-road span for a normally-open tie corridor — shared by the
+// backfeed tie search and the open-point balancing pass.
+export const TIE_SPAN_M = 2000;
 
 export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   // ---------- 1. customers → TX (≤ TX_MAX_M or ≤ TX_MAX_CUST)
@@ -98,6 +106,14 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   const loadNodes = buildLoadNodes(txs, customers, classOfCust);
   const loadAt = new Map(loadNodes.map((ln, i) => [ln.node, i]));
   const custAt = new Map(loadNodes.map(ln => [ln.node, ln.cust]));
+
+  const gridN = terrain.nx; // linear cell index stride
+  const isUnderground = (a, b) => {
+    const mx = (graph.nx[a] + graph.nx[b]) / 2;
+    const my = (graph.ny[a] + graph.ny[b]) / 2;
+    const [cx, cy] = terrain.cellOf(mx, my);
+    return density.grid[cy * gridN + cx] > UG_DENSITY_THRESH;
+  };
 
   // ---------- 2. TX → zone subs (growth), then SITE each sub
   const { of: growthOf, clusters } = growSubs(graph, loadNodes);
@@ -226,10 +242,28 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
           ks.sort((a, b) => (subC.get(b) - subC.get(a)) || a - b);
           for (const k of ks) { c += subC.get(k); L += subL.get(k); }
           if (c > FEEDER_MAX_CUST || L > FEEDER_MAX_KM * 1000) {
-            for (const k of ks) { // largest first
-              if (c <= FEEDER_MAX_CUST && L <= FEEDER_MAX_KM * 1000) break;
-              if (subC.get(k) < FEEDER_MIN_CUST) continue; // fold, don't cut dust
-              cut.add(k); c -= subC.get(k); L -= subL.get(k);
+            // BALANCED cuts: aim each resulting feeder at ~c/k rather than
+            // "cut until it just fits" — greedy fill-to-cap left every
+            // split pinned at the cap beside a dust remainder (a feeder
+            // with zero headroom, which no planner would sign off)
+            const kParts = Math.max(Math.ceil(c / FEEDER_MAX_CUST),
+              Math.ceil(L / (FEEDER_MAX_KM * 1000)));
+            const targetC = c / kParts;
+            for (let guard = ks.length; guard > 0; guard--) {
+              const over = c > FEEDER_MAX_CUST || L > FEEDER_MAX_KM * 1000;
+              if (!over && c <= targetC * 1.2) break;
+              let pick = -1, best = Infinity;
+              for (const k of ks) {
+                if (cut.has(k)) continue;
+                const sc = subC.get(k);
+                if (sc < FEEDER_MIN_CUST || c - sc < FEEDER_MIN_CUST) continue;
+                const miss = Math.abs((c - sc) - targetC);
+                if (miss < best) { best = miss; pick = k; }
+              }
+              if (pick === -1) break;
+              // don't overshoot far below target unless a hard cap forces it
+              if (!over && c - subC.get(pick) < targetC * 0.8) break;
+              cut.add(pick); c -= subC.get(pick); L -= subL.get(pick);
             }
           }
         }
@@ -340,13 +374,17 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   // that cannot be lawfully dissolved is kept and reported.
   const parsimony = { dissolved: 0, kept: 0, trials: 0 };
   {
-    const strandedCount = (split) =>
-      split.clusters.filter(c => stranded(c) && c.cust >= FEEDER_MIN_CUST).length;
+    // the two stranded bands are guarded SEPARATELY — a dissolve must not
+    // trade a small express away for a sub-worthy stranded block (a LOUD
+    // express); conserving the total count once allowed exactly that swap
+    const worthyCount = (split) => split.clusters.filter(subWorthy).length;
+    const exprCount = (split) => split.clusters.filter(c =>
+      stranded(c) && c.cust >= FEEDER_MIN_CUST && c.cust < SUB_MIN_CUST).length;
     const tinyCount = (split) =>
       split.clusters.filter(c => c.cust < FEEDER_MIN_CUST).length;
     let split = splitFeeders(lambda);
     let before = {
-      stranded: strandedCount(split), tiny: tinyCount(split),
+      worthy: worthyCount(split), expr: exprCount(split), tiny: tinyCount(split),
       totalByNode: new Map(subs.map(s => [s.node, lastCust[s.id]])),
       countByNode: new Map(subs.map(s => [s.node, split.perSubCount.get(s.id) ?? 0])),
     };
@@ -379,13 +417,15 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
         const was = before.countByNode.get(s.node) ?? 0;
         return now <= Math.max(was, FEEDERS_MAX_PER_SUB);
       });
-      const exceptOk = strandedCount(trialSplit) <= before.stranded &&
+      const exceptOk = worthyCount(trialSplit) <= before.worthy &&
+        exprCount(trialSplit) <= before.expr &&
         tinyCount(trialSplit) <= before.tiny;
       if (totalOk && countOk && exceptOk) {
         parsimony.dissolved++;
         split = trialSplit;
         before = {
-          stranded: strandedCount(trialSplit), tiny: tinyCount(trialSplit),
+          worthy: worthyCount(trialSplit), expr: exprCount(trialSplit),
+          tiny: tinyCount(trialSplit),
           totalByNode: new Map(subs.map(s => [s.node, lastCust[s.id]])),
           countByNode: new Map(subs.map(s => [s.node, trialSplit.perSubCount.get(s.id) ?? 0])),
         };
@@ -409,6 +449,449 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   const zeroLambda = new Float64Array(subs.length);
   const finalSplit = splitFeeders(zeroLambda);
 
+  // -------- shared cluster helpers for the repair passes below
+  const nodesOfCluster = finalSplit.clusters.map(() => []);
+  for (const [node, ci] of finalSplit.nodeCluster) nodesOfCluster[ci].push(node);
+  for (const arr of nodesOfCluster) arr.sort((a, b) => a - b);
+  // customers below each node WITHIN its cluster (children before parents)
+  const belowIn = (nodesArr, root) => {
+    const inCl = new Set(nodesArr);
+    const orderD = nodesArr.slice().sort((a, b) => dist[b] - dist[a] || a - b);
+    const below = new Map(nodesArr.map(v => [v, custAt.get(v) ?? 0]));
+    for (const v of orderD) {
+      const p = parent[v];
+      if (v !== root && inCl.has(p)) below.set(p, below.get(p) + below.get(v));
+    }
+    return below;
+  };
+  const kidsWithin = (nodesArr, root) => {
+    const inCl = new Set(nodesArr);
+    const kidsIn = new Map();
+    for (const v of nodesArr) {
+      if (v === root) continue;
+      const p = parent[v];
+      if (!inCl.has(p)) continue;
+      let arr = kidsIn.get(p);
+      if (!arr) kidsIn.set(p, arr = []);
+      arr.push(v);
+    }
+    return kidsIn;
+  };
+  const subtreeWithin = (kidsIn, w) => {
+    const moved = [];
+    const stack = [w];
+    while (stack.length) {
+      const v = stack.pop();
+      moved.push(v);
+      const ks = kidsIn.get(v);
+      if (ks) for (const k of ks) stack.push(k);
+    }
+    return moved;
+  };
+  // lead route root → busbar: re-homed clusters carry an explicit path
+  // (their parent[] chain still points at the OLD sub); everything else
+  // walks the tree
+  const leadWalk = (cl) => {
+    if (cl.leadPath) return cl.leadPath;
+    const path = [cl.root];
+    const subNode = subs[cl.sid].node;
+    for (let p = cl.root; parent[p] !== -1;) {
+      const q = parent[p];
+      path.push(q);
+      if (q === subNode) break;
+      p = q;
+    }
+    return path;
+  };
+  const leadStats = (cl) => {
+    const path = leadWalk(cl);
+    let ohM = 0, ugM = 0;
+    for (let i = 1; i < path.length; i++) {
+      const a = path[i - 1], b = path[i];
+      const l = Math.hypot(graph.nx[a] - graph.nx[b], graph.ny[a] - graph.ny[b]);
+      if (isUnderground(a, b)) ugM += l; else ohM += l;
+    }
+    return { ohM, ugM, path };
+  };
+
+  // ---------- 5b. OVERSHOOT RE-HOMING: a feeder that runs PAST another
+  // station hands the far subtree to the nearer one — but only when the
+  // receiver is meaningfully closer by road (≥ REHOME_MIN_GAIN_M), has
+  // ICP and breaker-position headroom (MERGE_HEADROOM), and the new exit
+  // lead is a lawful sibling lead. Overshoots past a FULL station are
+  // left alone — that is real capacity interleaving, not an accident.
+  // (Main source: the capacity bidding never relaxes λ once its station
+  // drops back under cap, leaving displaced boundaries behind.) The old
+  // boundary span is released and becomes a tie between the two feeders.
+  const rehome = { moved: 0, movedCust: 0, blockedHeadroom: 0, blockedLead: 0 };
+  const transferredRoots = new Set();
+  {
+    // unweighted nearest-station field (λ = 0), with path parents
+    const nearDist = new Float64Array(nN).fill(Infinity);
+    const nearSub = new Int32Array(nN).fill(-1);
+    const nearParent = new Int32Array(nN).fill(-1);
+    const nHeap = new NodeHeap();
+    for (const s of subs) {
+      nearDist[s.node] = 0; nearSub[s.node] = s.id;
+      nHeap.push(0, s.node);
+    }
+    const nSettled = new Uint8Array(nN);
+    while (nHeap.size) {
+      const v = nHeap.pop();
+      if (nSettled[v]) continue;
+      nSettled[v] = 1;
+      for (const ei of graph.adj[v]) {
+        const e = graph.edges[ei];
+        const w = e.a === v ? e.b : e.a;
+        const nd = nearDist[v] + e.len;
+        if (nd < nearDist[w] - 1e-9) {
+          nearDist[w] = nd; nearSub[w] = nearSub[v]; nearParent[w] = v;
+          nHeap.push(nd, w);
+        }
+      }
+    }
+    const subLoad = new Map(), posCount = new Map();
+    for (const cl of finalSplit.clusters) {
+      subLoad.set(cl.sid, (subLoad.get(cl.sid) ?? 0) + cl.cust);
+      posCount.set(cl.sid, (posCount.get(cl.sid) ?? 0) + 1);
+    }
+    const leadTo = (w, subNode) => {
+      const path = [w];
+      for (let p = w; p !== subNode && nearParent[p] !== -1;) {
+        p = nearParent[p];
+        path.push(p);
+        if (p === subNode) break;
+      }
+      return path;
+    };
+    const nCl = finalSplit.clusters.length; // new clusters are already homed right
+    for (let ci = 0; ci < nCl; ci++) {
+      const cl = finalSplit.clusters[ci];
+      if (cl.cust <= 0) continue;
+      const nodesArr = nodesOfCluster[ci];
+      const below = belowIn(nodesArr, cl.root);
+      const kidsIn = kidsWithin(nodesArr, cl.root);
+      const order = nodesArr.slice().sort((a, b) => dist[a] - dist[b] || a - b);
+      const skip = new Set();
+      for (const w of order) {
+        if (skip.has(w)) continue;
+        const rs = nearSub[w];
+        if (rs === -1 || rs === cl.sid) continue;
+        if (dist[w] - nearDist[w] < REHOME_MIN_GAIN_M) continue;
+        const n = below.get(w);
+        if (n < FEEDER_MIN_CUST) continue;
+        // never leave a sub-minimum remnant behind (it would be clipped)
+        if (w !== cl.root && cl.cust - n < FEEDER_MIN_CUST) continue;
+        if (nearDist[w] > LEAD_MAX_M) {
+          rehome.blockedLead++;
+          for (const v of subtreeWithin(kidsIn, w)) skip.add(v);
+          continue;
+        }
+        if ((subLoad.get(rs) ?? 0) + n > MERGE_HEADROOM * SUB_MAX_CUST ||
+            (posCount.get(rs) ?? 0) >= FEEDERS_MAX_PER_SUB) {
+          rehome.blockedHeadroom++;
+          for (const v of subtreeWithin(kidsIn, w)) skip.add(v);
+          continue;
+        }
+        // commit: subtree of w re-homes to the nearer station
+        const moved = subtreeWithin(kidsIn, w);
+        const shift = nearDist[w] - dist[w];
+        for (const v of moved) { dist[v] += shift; subOf[v] = rs; skip.add(v); }
+        const path = leadTo(w, subs[rs].node);
+        transferredRoots.add(w);
+        subLoad.set(cl.sid, subLoad.get(cl.sid) - n);
+        subLoad.set(rs, (subLoad.get(rs) ?? 0) + n);
+        if (w === cl.root) { // the whole feeder belongs to the nearer sub
+          posCount.set(cl.sid, posCount.get(cl.sid) - 1);
+          posCount.set(rs, (posCount.get(rs) ?? 0) + 1);
+          cl.sid = rs; cl.base = false; cl.leadM = nearDist[w]; cl.leadPath = path;
+        } else {
+          posCount.set(rs, (posCount.get(rs) ?? 0) + 1);
+          const nci = finalSplit.clusters.length;
+          finalSplit.clusters.push({
+            sid: rs, root: w, base: false, cust: n,
+            condM: 0, leadM: nearDist[w], leadPath: path, loads: [],
+          });
+          cl.cust -= n;
+          const movedSet = new Set(moved);
+          nodesOfCluster[ci] = nodesOfCluster[ci].filter(v => !movedSet.has(v));
+          nodesOfCluster.push(moved.slice().sort((a, b) => a - b));
+          for (const v of moved) finalSplit.nodeCluster.set(v, nci);
+        }
+        rehome.moved++;
+        rehome.movedCust += Math.round(n);
+      }
+    }
+  }
+
+  // ---------- 5c. OPEN-POINT BALANCING: a short, underloaded feeder
+  // ABSORBS load from a bigger neighbour across the shortest tie corridor
+  // between them. The corridor is ENERGISED (it becomes real sections of
+  // the absorber) and the donor's span above the moved block is released
+  // to become the new normally-open tie — the open point MOVES, exactly
+  // the operation a planner performs. Guards: absorber stays within
+  // MERGE_HEADROOM of the feeder cap (and its station of the station
+  // cap), the donor keeps a lawful feeder, balance strictly improves,
+  // and the moved block's supply route doesn't blow out.
+  const absorb = { moved: 0, movedCust: 0, candidates: 0 };
+  {
+    const isSubNode = new Uint8Array(nN);
+    for (const s of subs) isSubNode[s.node] = 1;
+    // corridor discovery: Dijkstra from every cluster node through
+    // NON-cluster nodes only (the roads no feeder uses), labelled by
+    // cluster — the same shape as the backfeed tie search
+    const cDist = new Float64Array(nN).fill(Infinity);
+    const cLab = new Int32Array(nN).fill(-1);
+    const cRoot = new Int32Array(nN).fill(-1);
+    const cParent = new Int32Array(nN).fill(-1);
+    const cParentEdge = new Int32Array(nN).fill(-1);
+    const cHeap = new NodeHeap();
+    for (const [node, ci] of finalSplit.nodeCluster) {
+      cDist[node] = 0; cLab[node] = ci; cRoot[node] = node;
+      cHeap.push(0, node);
+    }
+    const corridorBest = new Map(); // pair key → {v, w, edgeId, span}
+    const cSettled = new Uint8Array(nN);
+    while (cHeap.size) {
+      const v = cHeap.pop();
+      if (cSettled[v]) continue;
+      cSettled[v] = 1;
+      for (const ei of graph.adj[v]) {
+        const e = graph.edges[ei];
+        const w = e.a === v ? e.b : e.a;
+        if (isSubNode[w]) continue;
+        const wl = finalSplit.nodeCluster.get(w);
+        if (wl !== undefined) {
+          if (wl !== cLab[v]) {
+            const span = cDist[v] + e.len;
+            if (span <= TIE_SPAN_M) {
+              const a = cLab[v], b = wl;
+              const key = a < b ? a * 1048576 + b : b * 1048576 + a;
+              const cur = corridorBest.get(key);
+              if (!cur || span < cur.span) corridorBest.set(key, { v, w, edgeId: ei, span });
+            }
+          }
+          continue; // never traverse INTO cluster territory
+        }
+        const nd = cDist[v] + e.len;
+        if (nd < cDist[w] - 1e-9) {
+          cDist[w] = nd; cLab[w] = cLab[v]; cRoot[w] = cRoot[v];
+          cParent[w] = v; cParentEdge[w] = ei;
+          cHeap.push(nd, w);
+        }
+      }
+    }
+    // parent-walk lead chains: absorbing a block that another cluster's
+    // lead runs THROUGH (tree-wise) would break that lead — skip those.
+    // Explicit-path leads are physical parallels, unaffected by surgery.
+    const chainNodes = () => {
+      const s = new Set();
+      for (const cl of finalSplit.clusters) {
+        if (cl.base || cl.leadPath) continue;
+        const path = leadWalk(cl);
+        for (let i = 0; i < path.length; i++) s.add(path[i]);
+      }
+      return s;
+    };
+    let chains = chainNodes();
+    const subLoad = new Map();
+    for (const cl of finalSplit.clusters) {
+      subLoad.set(cl.sid, (subLoad.get(cl.sid) ?? 0) + cl.cust);
+    }
+    const cands = [...corridorBest.values()]
+      .sort((p, q) => p.span - q.span || p.v - q.v);
+    for (const cand of cands) {
+      if (absorb.moved >= 40) break;
+      // corridor endpoints' clusters may have changed after earlier moves
+      const seedNode = cRoot[cand.v];
+      const ciSeed = finalSplit.nodeCluster.get(seedNode);
+      const ciW = finalSplit.nodeCluster.get(cand.w);
+      if (ciSeed === undefined || ciW === undefined || ciSeed === ciW) continue;
+      // corridor must still be free road
+      const pathNodes = [];
+      let stale = false;
+      for (let p = cand.v; cDist[p] > 0; p = cParent[p]) {
+        if (finalSplit.nodeCluster.has(p)) { stale = true; break; }
+        pathNodes.push(p); // cand.v first, seed-adjacent last
+      }
+      if (stale) continue;
+      const clSeed = finalSplit.clusters[ciSeed], clW = finalSplit.clusters[ciW];
+      // absorber = the smaller feeder; it must be genuinely underloaded
+      const seedIsAbsorber = clSeed.cust <= clW.cust;
+      const abs_ = seedIsAbsorber ? clSeed : clW;
+      const don = seedIsAbsorber ? clW : clSeed;
+      const absAnchor = seedIsAbsorber ? seedNode : cand.w;
+      const donAnchor = seedIsAbsorber ? cand.w : seedNode;
+      const ciAbs = seedIsAbsorber ? ciSeed : ciW;
+      const ciDon = seedIsAbsorber ? ciW : ciSeed;
+      absorb.candidates++;
+      if (abs_.cust > BALANCE_ABSORBER_MAX) continue;
+      if (don.cust - abs_.cust < BALANCE_MIN_DIFF) continue;
+      if (stranded(abs_)) continue; // an express lead is no place to add load
+      const donNodes = nodesOfCluster[ciDon];
+      const below = belowIn(donNodes, don.root);
+      const n = below.get(donAnchor);
+      if (n === undefined || n < FEEDER_MIN_CUST) continue;
+      if (don.cust - n < FEEDER_MIN_CUST) continue;
+      if (abs_.cust + n > MERGE_HEADROOM * FEEDER_MAX_CUST) continue;
+      if (Math.abs((abs_.cust + n) - (don.cust - n)) >= Math.abs(abs_.cust - don.cust)) continue;
+      if (abs_.sid !== don.sid &&
+          (subLoad.get(abs_.sid) ?? 0) + n > MERGE_HEADROOM * SUB_MAX_CUST) continue;
+      // supply route sanity: the moved block may not detour far
+      const newAnchorDist = dist[absAnchor] + cand.span;
+      if (newAnchorDist > dist[donAnchor] + 5000) continue;
+      const kidsDon = kidsWithin(donNodes, don.root);
+      const moved = subtreeWithin(kidsDon, donAnchor);
+      let breaksLead = false;
+      for (const v of moved) if (chains.has(v)) { breaksLead = true; break; }
+      if (breaksLead) continue;
+      // ---- commit: energise the corridor toward the absorber
+      // pathNodes runs cand.v → … → (adjacent to seedNode)
+      if (seedIsAbsorber) {
+        // feed direction seedNode → … → cand.v → cand.w
+        let prev = seedNode;
+        for (let i = pathNodes.length - 1; i >= 0; i--) {
+          const p = pathNodes[i];
+          parent[p] = prev; parentEdge[p] = cParentEdge[p];
+          prev = p;
+        }
+        parent[cand.w] = prev; parentEdge[cand.w] = cand.edgeId;
+      } else {
+        // feed direction cand.w → cand.v → … → seedNode
+        let prev = cand.w, prevEdge = cand.edgeId;
+        for (let i = 0; i < pathNodes.length; i++) {
+          const p = pathNodes[i];
+          parent[p] = prev; parentEdge[p] = prevEdge;
+          prevEdge = cParentEdge[p]; prev = p;
+        }
+        parent[seedNode] = prev; parentEdge[seedNode] = prevEdge;
+      }
+      // corridor nodes join the absorber (loadless pass-through)
+      let cum = dist[absAnchor];
+      const corridorOrder = seedIsAbsorber ? pathNodes.slice().reverse() : pathNodes.slice();
+      for (const p of corridorOrder) {
+        cum += graph.edges[parentEdge[p]].len;
+        dist[p] = cum; subOf[p] = abs_.sid;
+        finalSplit.nodeCluster.set(p, ciAbs);
+        nodesOfCluster[ciAbs].push(p);
+      }
+      const shift = (dist[absAnchor] + cand.span) - dist[donAnchor];
+      const movedSet = new Set(moved);
+      for (const v of moved) {
+        dist[v] += shift; subOf[v] = abs_.sid;
+        finalSplit.nodeCluster.set(v, ciAbs);
+        nodesOfCluster[ciAbs].push(v);
+      }
+      nodesOfCluster[ciDon] = donNodes.filter(v => !movedSet.has(v));
+      abs_.cust += n; don.cust -= n;
+      subLoad.set(don.sid, subLoad.get(don.sid) - n);
+      subLoad.set(abs_.sid, (subLoad.get(abs_.sid) ?? 0) + n);
+      chains = chainNodes();
+      absorb.moved++;
+      absorb.movedCust += Math.round(n);
+    }
+  }
+
+  // ---------- 5d. RELIABILITY SPLITS: the caps say what a feeder MAY be;
+  // FEEDER_TARGET_SAIDI says what it SHOULD be. Feeders whose expected
+  // device-free SAIDI (standard fuses, DEFAULT fault rates — never the
+  // live UI sliders, so structure stays deterministic) exceeds the target
+  // are split worst-first (by customer·minutes, the league-table order)
+  // into siblings, while the station has breaker positions and the cut
+  // breaks no rule: lead ≤ LEAD_MAX_M, both halves ≥ FEEDER_MIN_CUST.
+  // What cannot lawfully split (long rural corridors whose interior is
+  // beyond lead reach, stations out of positions) is REPORTED, not forced.
+  const relSplits = { made: 0, blockedLead: 0, blockedPos: 0, overTarget: 0 };
+  {
+    const DEF_OH = DEFAULT_FAULT_RATES.oh, DEF_UG = DEFAULT_FAULT_RATES.ug;
+    // breaker positions AFTER re-homing — count live clusters per station
+    const posCount = new Map();
+    for (const cl of finalSplit.clusters) {
+      posCount.set(cl.sid, (posCount.get(cl.sid) ?? 0) + 1);
+    }
+    // expected device-free cust·min/yr of one cluster, fuses included
+    const clusterCustMin = (ci) => {
+      const cl = finalSplit.clusters[ci];
+      const nodesArr = nodesOfCluster[ci];
+      const below = belowIn(nodesArr, cl.root);
+      let cm = 0;
+      for (const v of nodesArr) {
+        if (v === cl.root && !cl.base) continue; // boundary span carries no circuit
+        const len = graph.edges[parentEdge[v]].len;
+        const rate = (isUnderground(v, parent[v]) ? DEF_UG : DEF_OH) * (len / 1000);
+        const dur = ((dist[v] - len / 2) / 1000) / TRAVEL_KMH * 60 + REPAIR_MIN;
+        const n = below.get(v);
+        cm += rate * dur * (n <= LATERAL_FUSE_MAX_CUST ? n : cl.cust);
+      }
+      if (!cl.base) { // lead exposure: a lead fault drops the whole cluster
+        const { ohM, ugM } = leadStats(cl);
+        cm += ((DEF_OH * ohM + DEF_UG * ugM) / 1000) *
+          ((cl.leadM / 2 / 1000) / TRAVEL_KMH * 60 + REPAIR_MIN) * cl.cust;
+      }
+      return cm;
+    };
+    const info = finalSplit.clusters.map((cl, ci) =>
+      cl.cust > 0 ? { cm: clusterCustMin(ci) } : { cm: 0 });
+    const blocked = new Set();
+    for (let guard = 0; guard < 80; guard++) {
+      let worst = -1, worstCm = 0;
+      for (let ci = 0; ci < finalSplit.clusters.length; ci++) {
+        if (blocked.has(ci)) continue;
+        const cl = finalSplit.clusters[ci];
+        if (cl.cust <= 0) continue;
+        if (info[ci].cm / cl.cust <= FEEDER_TARGET_SAIDI) continue;
+        if (info[ci].cm > worstCm) { worstCm = info[ci].cm; worst = ci; }
+      }
+      if (worst === -1) break;
+      const cl = finalSplit.clusters[worst];
+      if ((posCount.get(cl.sid) ?? 0) >= FEEDERS_MAX_PER_SUB) {
+        blocked.add(worst); relSplits.blockedPos++; continue;
+      }
+      // best legal cut: balance customers, lead within the sibling cap
+      const nodesArr = nodesOfCluster[worst];
+      const below = belowIn(nodesArr, cl.root);
+      let pick = -1, best = Infinity;
+      for (const w of nodesArr) {
+        if (w === cl.root || dist[w] > LEAD_MAX_M) continue;
+        const n = below.get(w);
+        if (n < FEEDER_MIN_CUST || cl.cust - n < FEEDER_MIN_CUST) continue;
+        const miss = Math.abs(n - cl.cust / 2);
+        if (miss < best || (miss === best && w < pick)) { best = miss; pick = w; }
+      }
+      if (pick === -1) { blocked.add(worst); relSplits.blockedLead++; continue; }
+      // commit: subtree of the cut node becomes a new sibling cluster
+      const kidsIn = kidsWithin(nodesArr, cl.root);
+      const moved = subtreeWithin(kidsIn, pick);
+      // a cut inside a re-homed cluster inherits its lead route: cut node
+      // → cluster root along the tree, then the cluster's explicit path
+      let leadPath;
+      if (cl.leadPath) {
+        leadPath = [pick];
+        for (let p = pick; p !== cl.root;) { p = parent[p]; leadPath.push(p); }
+        leadPath = leadPath.concat(cl.leadPath.slice(1));
+      }
+      const nci = finalSplit.clusters.length;
+      finalSplit.clusters.push({
+        sid: cl.sid, root: pick, base: false, cust: below.get(pick),
+        condM: 0, leadM: dist[pick], leadPath, loads: [],
+      });
+      if (transferredRoots.has(cl.root) || cl.leadPath) transferredRoots.add(pick);
+      cl.cust -= below.get(pick);
+      const movedSet = new Set(moved);
+      nodesOfCluster[worst] = nodesArr.filter(v => !movedSet.has(v));
+      nodesOfCluster.push(moved.sort((a, b) => a - b));
+      for (const v of moved) finalSplit.nodeCluster.set(v, nci);
+      posCount.set(cl.sid, (posCount.get(cl.sid) ?? 0) + 1);
+      info[worst] = { cm: clusterCustMin(worst) };
+      info.push({ cm: clusterCustMin(nci) });
+      relSplits.made++;
+    }
+    for (let ci = 0; ci < finalSplit.clusters.length; ci++) {
+      const cl = finalSplit.clusters[ci];
+      if (cl.cust > 0 && info[ci].cm / cl.cust > FEEDER_TARGET_SAIDI) relSplits.overTarget++;
+    }
+  }
+
   // ---------- 6. prune to the union of TX→sub paths
   const usedEdge = new Uint8Array(graph.edges.length);
   const custAtNode = new Float64Array(nN);
@@ -418,6 +901,9 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
     tx.sub = subOf[tx.node];
     custAtNode[tx.node] += tx.customers.length;
     for (let v = tx.node; parent[v] !== -1; v = parent[v]) {
+      // a re-homed cluster feeds via its NEW lead — the old corridor
+      // beyond its root goes back to being plain road (tie material)
+      if (transferredRoots.has(v)) break;
       if (usedEdge[parentEdge[v]]) break; // rest of path already marked
       usedEdge[parentEdge[v]] = 1;
     }
@@ -432,14 +918,6 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
   const feederOfNode = new Int32Array(nN).fill(-1);
   const subtreeCust = new Float64Array(nN);
   const allOrder = []; // parent-before-child, contiguous per sub
-
-  const gridN = terrain.nx; // linear cell index stride
-  const isUnderground = (a, b) => {
-    const mx = (graph.nx[a] + graph.nx[b]) / 2;
-    const my = (graph.ny[a] + graph.ny[b]) / 2;
-    const [cx, cy] = terrain.cellOf(mx, my);
-    return density.grid[cy * gridN + cx] > UG_DENSITY_THRESH;
-  };
 
   // deterministic feeder ids: clusters grouped by sub, base first, then by
   // lead length
@@ -461,9 +939,10 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
     feederOfNode[node] = feederIdOfCluster[ci];
   }
   const leadFeederAt = new Map(); // cluster root node → feeder id, cut clusters only
+  const clusterAtRoot = new Map();
   for (let i = 0; i < finalSplit.clusters.length; i++) {
     const c = finalSplit.clusters[i];
-    if (!c.base) leadFeederAt.set(c.root, feederIdOfCluster[i]);
+    if (!c.base) { leadFeederAt.set(c.root, feederIdOfCluster[i]); clusterAtRoot.set(c.root, c); }
   }
 
   for (const s of subs) {
@@ -476,6 +955,24 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
       if (parent[child] === s.node) stack.push(child);
     }
     stack.sort((a, b) => b - a);
+    while (stack.length) {
+      const v = stack.pop();
+      allOrder.push(v);
+      for (const ej of graph.adj[v]) {
+        if (!usedEdge[ej]) continue;
+        const e2 = graph.edges[ej];
+        const w = e2.a === v ? e2.b : e2.a;
+        if (parent[w] === v) stack.push(w);
+      }
+    }
+  }
+  // re-homed clusters hang from their new sub via an explicit lead, not a
+  // busbar-adjacent tree edge — seed their DFS separately (each block is
+  // self-contained and parent-before-child, which is all the subtree
+  // accumulation below needs)
+  for (const r of [...transferredRoots].sort((a, b) => a - b)) {
+    if (feederOfNode[r] < 0) continue;
+    const stack = [r];
     while (stack.length) {
       const v = stack.pop();
       allOrder.push(v);
@@ -500,21 +997,14 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
     const f = feeders[fid];
     if (leadFeederAt.get(v) === fid) {
       // virtual lead section: busbar → cluster root along the corridor
-      const path = [v];
-      let ohM = 0, ugM = 0;
-      const subNode = subs[f.sub].node;
-      for (let p = v; parent[p] !== -1;) {
-        const q = parent[p];
-        const len = graph.edges[parentEdge[p]].len;
-        if (isUnderground(p, q)) ugM += len; else ohM += len;
-        path.push(q);
-        if (q === subNode) break;
-        p = q;
-      }
-      usedEdge[parentEdge[v]] = 0; // boundary span → normally-open sibling tie
+      // (re-homed clusters carry an explicit path to their NEW station)
+      const { ohM, ugM, path } = leadStats(clusterAtRoot.get(v));
+      // boundary span → normally-open sibling tie (no-op for re-homed
+      // roots, whose old span was never claimed)
+      usedEdge[parentEdge[v]] = 0;
       const leadM = ohM + ugM;
       const te = {
-        id: treeEdges.length, node: v, parentNode: subNode,
+        id: treeEdges.length, node: v, parentNode: subs[f.sub].node,
         edgeId: -1, feeder: fid, lenM: leadM, midDistM: leadM / 2,
         bridge: false, underground: ugM > ohM, lead: true, path,
       };
@@ -705,6 +1195,38 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
         : `worst conductor ${(Math.max(...feeders.map(f => f.lengthM)) / 1000).toFixed(1)} km`) +
       (posOver.length ? `; ${posOver.length} sub(s) over ${FEEDERS_MAX_PER_SUB} positions: ${posOver.map(s => s.name).join(", ")}` : ""),
   });
+  // reliability splits — planning standard, not a hard cap: what cannot
+  // lawfully split is reported, never forced
+  extraChecks.push({
+    name: `Reliability splits (feeder expected SAIDI ≤ ${FEEDER_TARGET_SAIDI} min/yr, device-free @ default λ)`,
+    tunable: true,
+    pass: relSplits.overTarget === 0,
+    detail: `${relSplits.made} split(s) made worst-first within breaker positions; ` +
+      `${relSplits.overTarget} feeder(s) still over target — ` +
+      `${relSplits.blockedLead} with no lawful cut (interior beyond the ${LEAD_MAX_M / 1000} km lead cap / minimum sizes), ` +
+      `${relSplits.blockedPos} at stations out of positions`,
+  });
+  // overshoot re-homing — obvious wins only; what stays put stays for a
+  // reason (full station, or no lawful lead) and is counted
+  extraChecks.push({
+    name: `Overshoot re-homing (subtree ≥ ${REHOME_MIN_GAIN_M / 1000} km closer to another station)`,
+    tunable: true,
+    pass: true, // informational — blocked overshoots are legitimate interleaving
+    detail: `${rehome.moved} subtree(s) (${rehome.movedCust} customers) re-homed to their ` +
+      `road-nearest station; ${rehome.blockedHeadroom} left in place at stations without ` +
+      `ICP/position headroom (capacity interleaving), ${rehome.blockedLead} beyond a lawful ` +
+      `${LEAD_MAX_M / 1000} km lead`,
+  });
+  // open-point balancing — informational: how much load short feeders
+  // absorbed from bigger neighbours by moving normally-open points
+  extraChecks.push({
+    name: `Open-point balancing (feeders ≤ ${BALANCE_ABSORBER_MAX} absorb from neighbours ≥ ${BALANCE_MIN_DIFF} bigger)`,
+    tunable: true,
+    pass: true, // moves are opportunistic; what stays put failed a guard for a reason
+    detail: `${absorb.moved} block(s) (${absorb.movedCust} customers) absorbed across tie ` +
+      `corridors (open point moved, old span released as the new tie); ` +
+      `${absorb.candidates} pair(s) examined`,
+  });
   // express feeders — the sanctioned exception, counted and reported.
   // LOUD expresses (sub-worthy blocks stranded by an exhausted budget or
   // round cap) should be zero on healthy seeds.
@@ -757,7 +1279,7 @@ export function buildNetwork(terrain, graph, customers, towns, density, rng) {
       worstCircuitKm: +(Math.max(...feeders.map(f => f.lengthM)) / 1000).toFixed(1),
       expressFeeders: expressF.length,
       loudExpress: loudF.length,
-      parsimony,
+      parsimony, relSplits, rehome, absorb,
       ruleViolations: badFeeders.map(f => `F${f.id} ${Math.round(f.customers)}c/${(f.lengthM / 1000).toFixed(0)}km conductor`)
         .concat(overCapSubs.map(s => `${s.name} ${Math.round(subCust[s.id])} cust`))
         .concat(posOver.map(s => `${s.name} > ${FEEDERS_MAX_PER_SUB} positions`)),

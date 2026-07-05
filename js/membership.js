@@ -50,6 +50,26 @@ export const MERGE_HEADROOM = 0.9;   // parsimony may only absorb load into a
                                      // station up to this share of its caps
                                      // (spawn fires at >100% — the gap is the
                                      // hysteresis that prevents oscillation)
+export const BALANCE_ABSORBER_MAX = 600; // a feeder at or below this may
+                                     // ABSORB load from a bigger neighbour
+                                     // across their tie corridor (the
+                                     // normally-open point moves)
+export const BALANCE_MIN_DIFF = 300; // only pairs differing by at least
+                                     // this rebalance — planners don't
+                                     // shuffle open points for tidiness
+export const REHOME_MIN_GAIN_M = 2000; // re-home an overshooting feeder
+                                     // subtree to a nearer station only when
+                                     // the road-distance saving is at least
+                                     // this — obvious wins only, and never
+                                     // past a station without headroom
+export const FEEDER_TARGET_SAIDI = 400; // min/yr, EXPECTED device-free (with
+                                     // standard fuses, DEFAULT fault rates):
+                                     // feeders above this are split
+                                     // worst-first into siblings while the
+                                     // station has breaker positions and the
+                                     // cut breaks no rule — a reliability
+                                     // planning standard, not a hard cap;
+                                     // what cannot lawfully split is reported
 
 // Urban/rural is REPORTING-ONLY now (the caps are uniform): a customer is
 // urban when local density ≥ URBAN_CUST_PER_KM2 within DENSITY_RADIUS_M.

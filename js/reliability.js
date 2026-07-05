@@ -66,7 +66,11 @@ export const SWITCH_MIN = 45;
 // planning band (30 ≈ one TX group / small spur, not whole TX clusters).
 export const LATERAL_FUSE_MAX_CUST = 30;
 
-export const faultRates = { oh: 0.08, ug: 0.02 }; // faults / km / yr
+// Default fault rates. NETWORK STRUCTURE (the SAIDI-driven feeder splits
+// in network.js) is computed from these DEFAULTS so regeneration stays
+// deterministic — the live UI sliders below are analysis-only knobs.
+export const DEFAULT_FAULT_RATES = { oh: 0.08, ug: 0.02 }; // faults / km / yr
+export const faultRates = { ...DEFAULT_FAULT_RATES };
 
 export function setFaultRates(oh, ug) {
   if (isFinite(oh) && oh >= 0) faultRates.oh = oh;

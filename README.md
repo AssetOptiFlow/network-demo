@@ -136,11 +136,19 @@ simple rule caps — no fixed counts, no minimums.
    - **Clip** — a feeder still under `FEEDER_MIN_CUST = 20` after
      folding is PRUNED with its transformers and customers (uneconomic
      to reticulate) and the network rebuilt from the survivors.
-   Residual violations are reported, never hidden — measured **zero**
-   across the selftest seeds. 96–115 feeders (mean ≈ 430–520 customers)
-   at 50 000 customers. Sections in high-density cells are underground
-   cable (drawn dashed), the rest overhead; leads draw as fine dotted
-   lines along their corridor.
+   Cap cuts are BALANCED (each resulting feeder aims at ~equal share of
+   the branch, not "just under the cap" beside a dust remainder), and a
+   **reliability pass** then splits feeders whose expected device-free
+   SAIDI (standard fuses, DEFAULT fault rates — never the live sliders,
+   so regeneration stays deterministic) exceeds `FEEDER_TARGET_SAIDI =
+   400 min/yr`, worst-first by customer·minutes, while the station has
+   breaker positions and the cut breaks no rule. Long rural feeders whose
+   interior lies beyond the lead cap cannot lawfully split and are
+   REPORTED over target, not forced. Residual cap violations: measured
+   **zero** across the selftest seeds. ≈ 105–125 feeders (mean ≈ 400–470
+   customers) at 50 000 customers. Sections in high-density cells are
+   underground cable (drawn dashed), the rest overhead; leads draw as
+   fine dotted lines along their corridor.
 8. **Subtransmission** ([js/subtx.js](js/subtx.js)) — GXP on a flat
    map-edge cell near the load centroid; least-cost A* lines GXP → each
    sub (slope penalised, ocean blocked, river crossings 6×, road corridors
@@ -181,6 +189,17 @@ FEEDER_MIN_CUST     = 20    // feeders under this are pruned entirely
 LEAD_MAX_M          = 2000  // max unloaded exit lead for a sibling feeder;
                             // beyond this a circuit is an EXPRESS feeder
 MERGE_HEADROOM      = 0.9   // parsimony fills receivers to 90% at most
+FEEDER_TARGET_SAIDI = 400   // min/yr expected device-free (default λ):
+                            // a PLANNING STANDARD, not a cap — feeders
+                            // over it are split worst-first into siblings
+                            // while positions and the rules allow
+BALANCE_ABSORBER_MAX = 600  // short feeders at/below this ABSORB load from
+BALANCE_MIN_DIFF     = 300  // neighbours ≥ this much bigger, across their
+                            // tie corridor — the normally-open point MOVES
+                            // (old donor span released as the new tie)
+REHOME_MIN_GAIN_M    = 2000 // overshooting subtrees re-home to a station
+                            // at least this much road-closer (headroom-
+                            // gated; full stations keep their interleaving)
 ```
 
 Rules are enforced by construction wherever possible; the residue (a
